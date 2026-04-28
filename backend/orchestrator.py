@@ -2,7 +2,7 @@ import json
 import os
 import subprocess
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from database import DB_PATH
 from websocket import ws_manager
 from ollama_client import call_ollama, OllamaError
@@ -19,6 +19,13 @@ class Orchestrator:
         try:
             await self._update_status("planning_draft")
             roadmap = await self._planning_phase(feature_request, context)
+
+            if self._needs_human(roadmap):
+                roadmap = await self._wait_for_human(roadmap)
+                human_response = roadmap.get("_human_response", "")
+                await self._update_status("planning_draft")
+                roadmap = await self._planning_phase(feature_request, context, human_response)
+
             if not self._needs_human(roadmap):
                 await self._update_status("planning_finalize")
                 result = await self._execution_loop(roadmap)
@@ -37,16 +44,18 @@ class Orchestrator:
             await self._broadcast({"type": "error", "phase": "unknown", "message": str(e), "retryable": False})
             raise
 
-    async def _planning_phase(self, feature_request: str, context: dict):
+    async def _planning_phase(self, feature_request: str, context: dict, human_response: str = ""):
         planner = await self._get_agent("planner")
         working_dir = await self._get_setting("working_dir")
         files_content = self._read_context_files(context.get("selected_files", []), working_dir)
+
+        human_context = f"\n\nHuman response from previous request: {human_response}" if human_response else ""
 
         draft = await self._call_agent(planner, {
             "role": "system", "content": planner["system_prompt"]
         }, {
             "role": "user",
-            "content": f"Feature request:\n{feature_request}\n\nContext files:\n{files_content}\n\nKnown bugs: {context.get('known_bugs', [])}\nConstraints: {context.get('constraints', [])}\nExtra notes: {context.get('extra_notes', '')}\n\nProduce a phased roadmap with definition_of_done per phase."
+            "content": f"Feature request:\n{feature_request}\n\nContext files:\n{files_content}\n\nKnown bugs: {context.get('known_bugs', [])}\nConstraints: {context.get('constraints', [])}\nExtra notes: {context.get('extra_notes', '')}{human_context}\n\nProduce a phased roadmap with definition_of_done per phase."
         })
         await self._broadcast({"type": "agent_output", "phase": "planning_draft", "agent": "planner", "output": draft})
 
@@ -106,7 +115,7 @@ class Orchestrator:
             })
             await self._broadcast({"type": "agent_output", "phase": "coding", "agent": "coder", "output": coder_output})
             await self._append_output("coder_outputs", coder_output)
-            self._write_files(coder_output)
+            await self._write_files(coder_output)
 
             if self._needs_human(coder_output):
                 coder_output = await self._wait_for_human(coder_output)
@@ -188,11 +197,11 @@ class Orchestrator:
         db = await aiosqlite.connect(DB_PATH)
         await db.execute(
             "UPDATE runs SET status = ?, completed_at = ? WHERE id = ?",
-            (status, datetime.utcnow().isoformat() if status in ("done", "failed") else None, self.run_id)
+            (status, datetime.now(timezone.utc).isoformat() if status in ("done", "failed") else None, self.run_id)
         )
         await db.commit()
         await db.close()
-        await ws_manager.send(self.run_id, {"type": "phase_change", "phase": status, "message": f"Entering {status}", "timestamp": datetime.utcnow().isoformat()})
+        await ws_manager.send(self.run_id, {"type": "phase_change", "phase": status, "message": f"Entering {status}", "timestamp": datetime.now(timezone.utc).isoformat()})
 
     async def _broadcast(self, event: dict):
         await ws_manager.send(self.run_id, event)
@@ -217,7 +226,7 @@ class Orchestrator:
 
         db = await aiosqlite.connect(DB_PATH)
         requests = json.loads((await (await db.execute("SELECT human_requests FROM runs WHERE id = ?", (self.run_id,))).fetchone())["human_requests"] or "[]")
-        request_entry = {"request": req, "response": None, "timestamp": datetime.utcnow().isoformat()}
+        request_entry = {"request": req, "response": None, "timestamp": datetime.now(timezone.utc).isoformat()}
         requests.append(request_entry)
         await db.execute("UPDATE runs SET human_requests = ? WHERE id = ?", (json.dumps(requests), self.run_id))
         await db.commit()
@@ -235,9 +244,8 @@ class Orchestrator:
         output["_human_response"] = requests[-1]["response"]
         return output
 
-    def _write_files(self, coder_output: dict):
-        import asyncio as asyncio_mod
-        working_dir = asyncio_mod.run(self._get_setting("working_dir"))
+    async def _write_files(self, coder_output: dict):
+        working_dir = await self._get_setting("working_dir")
         if not working_dir:
             return
         for f in coder_output.get("patch_or_full_files", []):

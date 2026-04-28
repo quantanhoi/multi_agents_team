@@ -86,10 +86,10 @@ async def resume_run(run_id: int, response: HumanResponse):
             raise HTTPException(400, "No pending human input request")
 
         requests[-1]["response"] = response.model_dump()
-        # Restore previous status so orchestrator loop resumes
-        # The orchestrator poll loop will see status changed and continue
+        # Restore the previous status so orchestrator resumes from where it was
+        previous_status = row["status"]  # 'waiting_for_human'
         await db.execute(
-            "UPDATE runs SET human_requests = ?, status = 'coding' WHERE id = ?",
+            "UPDATE runs SET human_requests = ?, status = 'resuming' WHERE id = ?",
             (json.dumps(requests), run_id)
         )
         await db.commit()

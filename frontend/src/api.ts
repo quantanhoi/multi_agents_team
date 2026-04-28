@@ -1,10 +1,8 @@
 import { Agent, Job, Run, RunContext, Settings } from './types';
 
-const BASE = 'http://localhost:8000';
-
 async function req<T>(method: string, path: string, body?: any): Promise<T> {
   const opts: RequestInit = { method, headers: body ? { 'Content-Type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined };
-  const res = await fetch(`${BASE}${path}`, opts);
+  const res = await fetch(path, opts);
   if (!res.ok) throw new Error(`${method} ${path} failed: ${res.status}`);
   if (res.status === 204) return undefined as T;
   return res.json();

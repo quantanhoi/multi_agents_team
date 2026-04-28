@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { Run, RunStatus, WSMessage } from '../types';
+import { api } from '../api';
 import { ContextBuilder } from '../components/ContextBuilder';
 import { PhaseTimeline } from '../components/PhaseTimeline';
 import { OutputPanels } from '../components/OutputPanels';
@@ -108,11 +109,7 @@ export function RunPage() {
           inputType={humanRequest.input_type}
           onSubmit={async (text, files) => {
             if (!runId) return;
-            await fetch(`http://localhost:8000/api/runs/${runId}/resume`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ response_text: text, uploaded_files: files }),
-            });
+            await api.runs.resume(runId, { response_text: text, uploaded_files: files });
             setHumanRequest(null);
             setState('running');
           }}
