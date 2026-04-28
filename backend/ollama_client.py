@@ -4,7 +4,7 @@ import httpx
 class OllamaError(Exception):
     pass
 
-async def call_ollama(endpoint: str, model: str, messages: list, temperature: float = 0.3, max_retries: int = 2) -> dict:
+async def call_ollama(endpoint: str, model: str, messages: list, temperature: float = 0.3, api_key: str = "", max_retries: int = 2) -> dict:
     url = f"{endpoint}/api/chat"
     payload = {
         "model": model,
@@ -14,11 +14,15 @@ async def call_ollama(endpoint: str, model: str, messages: list, temperature: fl
         "options": {"temperature": temperature}
     }
 
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
     last_error = None
     for attempt in range(max_retries + 1):
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(url, json=payload)
+                resp = await client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
                 content = data["message"]["content"]

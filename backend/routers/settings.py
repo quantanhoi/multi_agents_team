@@ -9,6 +9,7 @@ async def get_settings():
     return SettingsResponse(
         working_dir=await get_setting("working_dir"),
         ollama_endpoint=await get_setting("ollama_endpoint", "http://localhost:11434"),
+        ollama_api_key=await get_setting("ollama_api_key", ""),
         default_temperature=float(await get_setting("default_temperature", "0.3"))
     )
 

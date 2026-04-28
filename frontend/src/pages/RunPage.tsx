@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { Run, RunStatus, WSMessage } from '../types';
 import { api } from '../api';
 import { ContextBuilder } from '../components/ContextBuilder';
@@ -16,22 +16,50 @@ export function RunPage() {
   const [planOutput, setPlanOutput] = useState<any>(null);
   const [coderOutputs, setCoderOutputs] = useState<any[]>([]);
   const [testReports, setTestReports] = useState<any[]>([]);
+  const [errors, setErrors] = useState<{phase: string; message: string}[]>([]);
   const [humanRequest, setHumanRequest] = useState<{ message: string; requested_by: string; input_type: string } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptRef = useRef(0);
   const phasesRef = useRef<{ current: RunStatus; completed: RunStatus[] }>({ current: 'pending', completed: [] });
 
   const allPhases: RunStatus[] = ['planning_draft', 'planning_review_coder', 'planning_review_tester', 'planning_finalize', 'coding', 'testing', 'evaluating'];
 
-  const connectWS = (runId: number) => {
-    const ws = new WebSocket(`ws://localhost:8002/ws/runs/${runId}`);
+  const clearReconnect = useCallback(() => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+  }, []);
+
+  const connectWS = useCallback((targetRunId: number) => {
+    clearReconnect();
+    const ws = new WebSocket(`ws://localhost:8002/ws/runs/${targetRunId}`);
     wsRef.current = ws;
+
+    ws.onopen = () => {
+      reconnectAttemptRef.current = 0;
+    };
+
     ws.onmessage = (e) => {
       const msg: WSMessage = JSON.parse(e.data);
       handleWSMessage(msg);
     };
-    ws.onclose = () => { wsRef.current = null; };
-    ws.onerror = () => { /* handled by onclose */ };
-  };
+
+    ws.onclose = () => {
+      wsRef.current = null;
+      // Auto-reconnect with exponential backoff (max 30s) unless run is done/failed
+      if (state !== 'done' && targetRunId) {
+        const delay = Math.min(1000 * 2 ** reconnectAttemptRef.current, 30000);
+        reconnectAttemptRef.current += 1;
+        reconnectTimeoutRef.current = setTimeout(() => connectWS(targetRunId), delay);
+      }
+    };
+
+    ws.onerror = () => {
+      // onclose handles reconnection
+    };
+  }, [clearReconnect, state]);
 
   const handleWSMessage = (msg: WSMessage) => {
     const p = phasesRef.current;
@@ -57,6 +85,11 @@ export function RunPage() {
           setTestReports(prev => [...prev, msg.output]);
         }
         break;
+      case 'phase_error':
+        if (msg.phase && msg.message) {
+          setErrors(prev => [...prev, { phase: msg.phase!, message: msg.message! }]);
+        }
+        break;
       case 'human_input_required':
         setState('waiting');
         setHumanRequest({ message: msg.message!, requested_by: msg.requested_by!, input_type: msg.input_type || 'text' });
@@ -66,10 +99,12 @@ export function RunPage() {
         setCompletedPhases([...p.completed]);
         setCurrentPhase('done');
         setState('done');
+        clearReconnect();
         break;
       case 'failed':
         setCurrentPhase('failed');
         setState('done');
+        clearReconnect();
         break;
     }
   };
@@ -82,14 +117,18 @@ export function RunPage() {
     setPlanOutput(null);
     setCoderOutputs([]);
     setTestReports([]);
+    setErrors([]);
     setHumanRequest(null);
     setState('running');
     connectWS(run.id);
   };
 
   useEffect(() => {
-    return () => { wsRef.current?.close(); };
-  }, []);
+    return () => {
+      clearReconnect();
+      wsRef.current?.close();
+    };
+  }, [clearReconnect]);
 
   return (
     <div>
@@ -98,6 +137,16 @@ export function RunPage() {
       {(state === 'running' || state === 'waiting' || state === 'done') && (
         <div>
           <PhaseTimeline currentPhase={currentPhase} completedPhases={completedPhases} allPhases={allPhases} />
+
+          {errors.length > 0 && (
+            <div className="mb-4 p-3 bg-red-50 rounded-lg border border-red-200">
+              <h4 className="text-sm font-semibold text-red-700 mb-1">Phase Errors</h4>
+              {errors.map((err, i) => (
+                <p key={i} className="text-xs text-red-600">{err.phase}: {err.message}</p>
+              ))}
+            </div>
+          )}
+
           <OutputPanels planOutput={planOutput} coderOutputs={coderOutputs} testReports={testReports} />
         </div>
       )}
@@ -121,7 +170,11 @@ export function RunPage() {
           <p className="font-semibold text-green-800">
             {currentPhase === 'done' ? 'Run completed successfully!' : 'Run failed.'}
           </p>
-          <button onClick={() => setState('idle')} className="mt-2 px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Start New Run</button>
+          <button onClick={() => {
+            clearReconnect();
+            setState('idle');
+            setRunId(null);
+          }} className="mt-2 px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Start New Run</button>
         </div>
       )}
     </div>

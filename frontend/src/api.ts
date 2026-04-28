@@ -1,8 +1,10 @@
 import { Agent, Job, Run, RunContext, Settings } from './types';
 
+const BASE = (import.meta as any).env?.VITE_API_BASE_URL || '';
+
 async function req<T>(method: string, path: string, body?: any): Promise<T> {
   const opts: RequestInit = { method, headers: body ? { 'Content-Type': 'application/json' } : undefined, body: body ? JSON.stringify(body) : undefined };
-  const res = await fetch(path, opts);
+  const res = await fetch(`${BASE}${path}`, opts);
   if (!res.ok) throw new Error(`${method} ${path} failed: ${res.status}`);
   if (res.status === 204) return undefined as T;
   return res.json();
@@ -36,6 +38,9 @@ export const api = {
     resume: (id: number, response: { response_text: string; uploaded_files: string[] }) =>
       req<any>('POST', `/api/runs/${id}/resume`, response),
     stop: (id: number) => req<any>('POST', `/api/runs/${id}/stop`),
+  },
+  ollama: {
+    models: () => req<{name: string; size: number; digest: string; modified_at: string}[]>('GET', '/api/ollama/models'),
   },
   settings: {
     get: () => req<Settings>('GET', '/api/settings'),

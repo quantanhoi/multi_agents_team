@@ -1,16 +1,14 @@
-version: "3.8"
-
 services:
   backend:
     build: ./backend
     container_name: multi-agent-backend
     ports:
-      - "8002:8000"
+      - "${BACKEND_PORT:-8002}:8000"
     volumes:
       - ./backend:/app
       - backend_data:/app/data
     environment:
-      - OLLAMA_ENDPOINT=http://host.docker.internal:11435
+      - OLLAMA_ENDPOINT=${OLLAMA_ENDPOINT:-http://host.docker.internal:11435}
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
@@ -18,7 +16,7 @@ services:
     build: ./frontend
     container_name: multi-agent-frontend
     ports:
-      - "5173:5173"
+      - "${FRONTEND_PORT:-5173}:5173"
     volumes:
       - ./frontend/src:/app/src
     environment:

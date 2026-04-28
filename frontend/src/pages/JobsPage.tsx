@@ -9,7 +9,7 @@ export function JobsPage() {
   const [editJob, setEditJob] = useState<Job | null>(null);
   const queryClient = useQueryClient();
 
-  const { data: jobs, isLoading } = useQuery({ queryKey: ['jobs'], queryFn: api.jobs.list });
+  const { data: jobs, isLoading, isFetching } = useQuery({ queryKey: ['jobs'], queryFn: api.jobs.list });
   const { data: agents } = useQuery({ queryKey: ['agents'], queryFn: api.agents.list });
   const deleteMutation = useMutation({
     mutationFn: api.jobs.delete,
@@ -18,12 +18,15 @@ export function JobsPage() {
 
   const agentName = (id: number) => agents?.find(a => a.id === id)?.name || `Agent #${id}`;
 
-  if (isLoading) return <div className="p-4">Loading...</div>;
+  if (isLoading && !jobs) return <div className="p-4">Loading...</div>;
 
   return (
     <div>
       <div className="flex justify-between items-center mb-4">
-        <h2 className="text-xl font-bold">Jobs</h2>
+        <div className="flex items-center gap-2">
+          <h2 className="text-xl font-bold">Jobs</h2>
+          {isFetching && <span className="text-xs text-gray-400 animate-pulse">refreshing...</span>}
+        </div>
         <button onClick={() => { setEditJob(null); setShowForm(true); }} className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">+ New Job</button>
       </div>
 

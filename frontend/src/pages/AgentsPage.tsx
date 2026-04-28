@@ -9,13 +9,13 @@ export function AgentsPage() {
   const [editAgent, setEditAgent] = useState<Agent | null>(null);
   const queryClient = useQueryClient();
 
-  const { data: agents, isLoading } = useQuery({ queryKey: ['agents'], queryFn: api.agents.list });
+  const { data: agents, isLoading, isFetching } = useQuery({ queryKey: ['agents'], queryFn: api.agents.list });
   const deleteMutation = useMutation({
     mutationFn: api.agents.delete,
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['agents'] }),
   });
 
-  if (isLoading) return <div className="p-4">Loading...</div>;
+  if (isLoading && !agents) return <div className="p-4">Loading...</div>;
 
   const roleColors: Record<AgentRole, string> = {
     planner: 'bg-blue-100 text-blue-800',
@@ -26,7 +26,10 @@ export function AgentsPage() {
   return (
     <div>
       <div className="flex justify-between items-center mb-4">
-        <h2 className="text-xl font-bold">Agent Library</h2>
+        <div className="flex items-center gap-2">
+          <h2 className="text-xl font-bold">Agent Library</h2>
+          {isFetching && <span className="text-xs text-gray-400 animate-pulse">refreshing...</span>}
+        </div>
         <button onClick={() => { setEditAgent(null); setShowForm(true); }} className="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">+ New Agent</button>
       </div>
 

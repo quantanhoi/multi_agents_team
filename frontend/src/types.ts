@@ -4,6 +4,7 @@ export type RunStatus = 'pending' | 'planning_draft' | 'planning_review_coder' |
 export interface Agent {
   id: number; name: string; role: AgentRole; model_name: string;
   system_prompt: string; temperature: number; ollama_endpoint: string;
+  api_key: string;
   created_at: string; updated_at: string;
 }
 
@@ -31,7 +32,7 @@ export interface Run {
 }
 
 export interface Settings {
-  working_dir: string; ollama_endpoint: string; default_temperature: number;
+  working_dir: string; ollama_endpoint: string; ollama_api_key: string; default_temperature: number;
 }
 
 export interface HumanInputRequest {
@@ -39,7 +40,7 @@ export interface HumanInputRequest {
 }
 
 export interface WSMessage {
-  type: 'phase_change' | 'agent_output' | 'human_input_required' | 'done' | 'failed' | 'error';
+  type: 'phase_change' | 'agent_output' | 'human_input_required' | 'done' | 'failed' | 'error' | 'phase_error';
   phase?: string; message?: string; agent?: string; output?: any;
   requested_by?: string; input_type?: string; status?: string; summary?: string;
   retryable?: boolean;

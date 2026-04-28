@@ -13,7 +13,8 @@ class AgentCreate(BaseModel):
     model_name: str
     system_prompt: str
     temperature: float = 0.3
-    ollama_endpoint: str = "http://localhost:11434"
+    ollama_endpoint: str = "http://localhost:11435"
+    api_key: str = ""
 
 class AgentUpdate(BaseModel):
     name: Optional[str] = None
@@ -21,6 +22,7 @@ class AgentUpdate(BaseModel):
     system_prompt: Optional[str] = None
     temperature: Optional[float] = None
     ollama_endpoint: Optional[str] = None
+    api_key: Optional[str] = None
 
 class AgentResponse(BaseModel):
     id: int
@@ -30,6 +32,7 @@ class AgentResponse(BaseModel):
     system_prompt: str
     temperature: float
     ollama_endpoint: str
+    api_key: str
     created_at: str
     updated_at: str
 
@@ -103,9 +106,11 @@ class RunResponse(BaseModel):
 class SettingsResponse(BaseModel):
     working_dir: str
     ollama_endpoint: str
+    ollama_api_key: str
     default_temperature: float
 
 class SettingsUpdate(BaseModel):
     working_dir: Optional[str] = None
     ollama_endpoint: Optional[str] = None
+    ollama_api_key: Optional[str] = None
     default_temperature: Optional[float] = None

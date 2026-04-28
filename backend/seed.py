@@ -7,6 +7,14 @@ from database import DB_PATH, init_db
 async def seed():
     await init_db()
     db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+
+    # Check if defaults already exist — only seed once
+    existing = await (await db.execute("SELECT COUNT(*) as count FROM agents")).fetchone()
+    if existing and existing["count"] > 0:
+        print(f"Database already seeded ({existing['count']} agents found). Skipping.")
+        await db.close()
+        return
 
     # Create 3 default agents
     agents = [
@@ -21,7 +29,7 @@ async def seed():
     agent_ids = []
     for name, role, model, prompt in agents:
         cursor = await db.execute(
-            "INSERT INTO agents (name, role, model_name, system_prompt, temperature) VALUES (?, ?, ?, ?, 0.3)",
+            "INSERT INTO agents (name, role, model_name, system_prompt, temperature, api_key) VALUES (?, ?, ?, ?, 0.3, '')",
             (name, role, model, prompt)
         )
         agent_ids.append(cursor.lastrowid)

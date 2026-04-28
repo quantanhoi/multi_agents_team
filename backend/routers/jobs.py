@@ -1,14 +1,16 @@
 import json
 from fastapi import APIRouter, HTTPException
 from typing import List
-from database import get_db
+import aiosqlite
+from database import DB_PATH
 from models import JobCreate, JobUpdate, JobResponse
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 @router.get("", response_model=List[JobResponse])
 async def list_jobs():
-    db = await anext(get_db())
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
     try:
         rows = await db.execute("SELECT * FROM jobs ORDER BY created_at DESC")
         jobs = await rows.fetchall()
@@ -23,7 +25,8 @@ async def list_jobs():
 
 @router.post("", response_model=JobResponse, status_code=201)
 async def create_job(job: JobCreate):
-    db = await anext(get_db())
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
     try:
         for role, agent_id in [("planner", job.planner_agent_id), ("coder", job.coder_agent_id), ("tester", job.tester_agent_id)]:
             exists = await (await db.execute("SELECT id FROM agents WHERE id = ? AND role = ?", (agent_id, role))).fetchone()
@@ -44,7 +47,8 @@ async def create_job(job: JobCreate):
 
 @router.get("/{job_id}", response_model=JobResponse)
 async def get_job(job_id: int):
-    db = await anext(get_db())
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
     try:
         row = await (await db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))).fetchone()
         if not row:
@@ -57,7 +61,8 @@ async def get_job(job_id: int):
 
 @router.put("/{job_id}", response_model=JobResponse)
 async def update_job(job_id: int, updates: JobUpdate):
-    db = await anext(get_db())
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
     try:
         existing = await (await db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))).fetchone()
         if not existing:
@@ -84,7 +89,8 @@ async def update_job(job_id: int, updates: JobUpdate):
 
 @router.delete("/{job_id}", status_code=204)
 async def delete_job(job_id: int):
-    db = await anext(get_db())
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
     try:
         existing = await (await db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))).fetchone()
         if not existing:

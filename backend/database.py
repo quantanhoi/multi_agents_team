@@ -23,6 +23,7 @@ async def init_db():
             system_prompt TEXT NOT NULL,
             temperature REAL DEFAULT 0.3,
             ollama_endpoint TEXT DEFAULT 'http://localhost:11435',
+            api_key TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         );
@@ -53,12 +54,24 @@ async def init_db():
             started_at TEXT DEFAULT (datetime('now')),
             completed_at TEXT DEFAULT NULL
         );
+        CREATE TABLE IF NOT EXISTS run_steps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER REFERENCES runs(id),
+            phase TEXT NOT NULL,
+            agent TEXT,
+            input TEXT,
+            output TEXT,
+            latency_ms INTEGER,
+            error TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
         INSERT OR IGNORE INTO settings (key, value) VALUES ('working_dir', '');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('ollama_endpoint', 'http://localhost:11435');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('ollama_api_key', '');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('default_temperature', '0.3');
     """)
     await db.commit()

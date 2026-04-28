@@ -1,10 +1,11 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from typing import Optional, List
 import json
-from database import DB_PATH, get_db
+import aiosqlite
+from database import DB_PATH
 from models import RunStart, RunResponse, HumanResponse
 from orchestrator import Orchestrator
-import aiosqlite
+from websocket import ws_manager
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
@@ -21,7 +22,8 @@ def _db_to_run(row) -> dict:
 
 @router.post("", response_model=RunResponse, status_code=201)
 async def start_run(data: RunStart, background_tasks: BackgroundTasks):
-    db = await anext(get_db())
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
     try:
         job = await (await db.execute("SELECT * FROM jobs WHERE id = ?", (data.job_id,))).fetchone()
         if not job:
@@ -44,7 +46,8 @@ async def start_run(data: RunStart, background_tasks: BackgroundTasks):
 
 @router.get("", response_model=List[RunResponse])
 async def list_runs(job_id: Optional[int] = None, status: Optional[str] = None):
-    db = await anext(get_db())
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
     try:
         query = "SELECT * FROM runs"
         params = []
@@ -65,7 +68,8 @@ async def list_runs(job_id: Optional[int] = None, status: Optional[str] = None):
 
 @router.get("/{run_id}", response_model=RunResponse)
 async def get_run(run_id: int):
-    db = await anext(get_db())
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
     try:
         row = await (await db.execute("SELECT * FROM runs WHERE id = ?", (run_id,))).fetchone()
         if not row:
@@ -76,7 +80,8 @@ async def get_run(run_id: int):
 
 @router.post("/{run_id}/resume")
 async def resume_run(run_id: int, response: HumanResponse):
-    db = await anext(get_db())
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
     try:
         row = await (await db.execute("SELECT * FROM runs WHERE id = ?", (run_id,))).fetchone()
         if not row:
@@ -86,20 +91,21 @@ async def resume_run(run_id: int, response: HumanResponse):
             raise HTTPException(400, "No pending human input request")
 
         requests[-1]["response"] = response.model_dump()
-        # Restore the previous status so orchestrator resumes from where it was
-        previous_status = row["status"]  # 'waiting_for_human'
+        previous_status = requests[-1].get("previous_status", "planning_draft")
         await db.execute(
-            "UPDATE runs SET human_requests = ?, status = 'resuming' WHERE id = ?",
-            (json.dumps(requests), run_id)
+            "UPDATE runs SET human_requests = ?, status = ? WHERE id = ?",
+            (json.dumps(requests), previous_status, run_id)
         )
         await db.commit()
+        ws_manager.signal_human_input(run_id)
         return {"status": "resumed"}
     finally:
         await db.close()
 
 @router.post("/{run_id}/stop")
 async def stop_run(run_id: int):
-    db = await anext(get_db())
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
     try:
         await db.execute("UPDATE runs SET status = 'failed', completed_at = datetime('now') WHERE id = ?", (run_id,))
         await db.commit()
