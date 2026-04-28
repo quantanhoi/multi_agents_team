@@ -22,7 +22,7 @@ async def init_db():
             model_name TEXT NOT NULL,
             system_prompt TEXT NOT NULL,
             temperature REAL DEFAULT 0.3,
-            ollama_endpoint TEXT DEFAULT 'http://localhost:11434',
+            ollama_endpoint TEXT DEFAULT 'http://localhost:11435',
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         );
@@ -58,7 +58,7 @@ async def init_db():
             value TEXT NOT NULL
         );
         INSERT OR IGNORE INTO settings (key, value) VALUES ('working_dir', '');
-        INSERT OR IGNORE INTO settings (key, value) VALUES ('ollama_endpoint', 'http://localhost:11434');
+        INSERT OR IGNORE INTO settings (key, value) VALUES ('ollama_endpoint', 'http://localhost:11435');
         INSERT OR IGNORE INTO settings (key, value) VALUES ('default_temperature', '0.3');
     """)
     await db.commit()

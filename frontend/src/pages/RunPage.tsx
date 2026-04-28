@@ -23,7 +23,7 @@ export function RunPage() {
   const allPhases: RunStatus[] = ['planning_draft', 'planning_review_coder', 'planning_review_tester', 'planning_finalize', 'coding', 'testing', 'evaluating'];
 
   const connectWS = (runId: number) => {
-    const ws = new WebSocket(`ws://localhost:8000/ws/runs/${runId}`);
+    const ws = new WebSocket(`ws://localhost:8002/ws/runs/${runId}`);
     wsRef.current = ws;
     ws.onmessage = (e) => {
       const msg: WSMessage = JSON.parse(e.data);
