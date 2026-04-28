@@ -7,6 +7,7 @@ services:
     volumes:
       - ./backend:/app
       - backend_data:/app/data
+      - ${PROJECT_DIR:-./projects}:/workspace
     environment:
       - OLLAMA_ENDPOINT=${OLLAMA_ENDPOINT:-http://host.docker.internal:11435}
     extra_hosts:

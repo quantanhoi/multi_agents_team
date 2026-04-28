@@ -55,6 +55,10 @@ export function ContextBuilder({ onRunStart }: { onRunStart: (run: Run) => void 
         <div>
           <label className="block text-sm font-medium mb-1">Files (comma-separated paths)</label>
           <input className="border rounded w-full px-3 py-2 text-sm" value={files} onChange={e => setFiles(e.target.value)} placeholder="src/app.py, src/models.py" />
+          <p className="text-xs text-gray-500 mt-1">
+            Paths are relative to the <strong>Working Directory</strong> set in <a href="#/settings" className="text-blue-600 underline">Settings</a>.
+            If using Docker, set <code>PROJECT_DIR</code> in <code>.env</code> and use <code>/workspace</code> as Working Directory.
+          </p>
         </div>
         <div>
           <label className="block text-sm font-medium mb-1">Known Bugs (one per line)</label>
