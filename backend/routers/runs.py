@@ -1,9 +1,10 @@
 from fastapi import APIRouter, HTTPException, BackgroundTasks
+from pathlib import Path
 from typing import Optional, List
 import json
 import aiosqlite
 from database import DB_PATH
-from models import RunStart, RunResponse, HumanResponse
+from models import RunStart, RunResponse, HumanResponse, StepOut
 from orchestrator import Orchestrator
 from websocket import ws_manager
 from opencode_agent import OpenCodeAgentError
@@ -113,3 +114,25 @@ async def stop_run(run_id: int):
         return {"status": "stopped"}
     finally:
         await db.close()
+
+@router.get("/{run_id}/steps", response_model=List[StepOut])
+async def get_run_steps(run_id: int):
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        cursor = await db.execute(
+            "SELECT * FROM run_steps WHERE run_id = ? ORDER BY step_number",
+            (run_id,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        await db.close()
+
+@router.get("/{run_id}/changelog")
+async def get_run_changelog(run_id: int):
+    worktree_path = Path(".") / ".worktrees" / f"run-{run_id}"
+    changelog = worktree_path / "CHANGELOG.md"
+    if changelog.exists():
+        return {"content": changelog.read_text()}
+    return {"content": ""}
