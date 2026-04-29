@@ -50,6 +50,7 @@ class JobCreate(BaseModel):
     agent_overrides: dict = {}
     loop_mode: str = "automatic"
     max_iterations: int = 5
+    definition_of_done: str = ""
 
 class JobUpdate(BaseModel):
     name: Optional[str] = None
@@ -71,6 +72,7 @@ class JobResponse(BaseModel):
     agent_overrides: dict
     loop_mode: str
     max_iterations: int
+    definition_of_done: str
     created_at: str
     updated_at: str
 
@@ -102,6 +104,21 @@ class RunResponse(BaseModel):
     human_requests: list = []
     started_at: str
     completed_at: Optional[str] = None
+
+class StepOut(BaseModel):
+    id: int
+    run_id: int
+    step_number: int
+    step_type: str
+    phase: str
+    agent: str
+    input: str
+    output: Optional[str]
+    latency_ms: int
+    error: Optional[str]
+    files_changed: Optional[str]
+    git_commit: Optional[str]
+    created_at: str
 
 class SettingsResponse(BaseModel):
     working_dir: str

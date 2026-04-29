@@ -10,9 +10,34 @@ async def get_db():
     finally:
         await db.close()
 
+async def migrate_database():
+    """Apply schema migrations for existing databases."""
+    db = await aiosqlite.connect(DB_PATH)
+
+    migrations = [
+        ("ALTER TABLE run_steps ADD COLUMN step_number INTEGER", "duplicate column name"),
+        ("ALTER TABLE run_steps ADD COLUMN step_type TEXT", "duplicate column name"),
+        ("ALTER TABLE run_steps ADD COLUMN files_changed TEXT", "duplicate column name"),
+        ("ALTER TABLE run_steps ADD COLUMN git_commit TEXT", "duplicate column name"),
+        ("ALTER TABLE jobs ADD COLUMN definition_of_done TEXT DEFAULT ''", "duplicate column name"),
+    ]
+
+    for sql, ignore_msg in migrations:
+        try:
+            await db.execute(sql)
+        except Exception as e:
+            if ignore_msg.lower() not in str(e).lower():
+                raise
+
+    await db.commit()
+    await db.close()
+
 async def init_db():
     import os
     os.makedirs("data", exist_ok=True)
+
+    await migrate_database()
+
     db = await aiosqlite.connect(DB_PATH)
     await db.executescript("""
         CREATE TABLE IF NOT EXISTS agents (
@@ -37,6 +62,7 @@ async def init_db():
             agent_overrides TEXT DEFAULT '{}',
             loop_mode TEXT DEFAULT 'automatic' CHECK(loop_mode IN ('automatic','manual')),
             max_iterations INTEGER DEFAULT 5,
+            definition_of_done TEXT DEFAULT '',
             created_at TEXT DEFAULT (datetime('now')),
             updated_at TEXT DEFAULT (datetime('now'))
         );
@@ -57,12 +83,16 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS run_steps (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id INTEGER REFERENCES runs(id),
+            step_number INTEGER,
+            step_type TEXT,
             phase TEXT NOT NULL,
             agent TEXT,
             input TEXT,
             output TEXT,
             latency_ms INTEGER,
             error TEXT,
+            files_changed TEXT,
+            git_commit TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS settings (
