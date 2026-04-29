@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../api';
 import { Run, RunContext } from '../types';
+import { useRunContext } from '../context/RunContext';
 
-export function ContextBuilder({ onRunStart }: { onRunStart: (run: Run) => void }) {
+export function ContextBuilder({ onRunStart }: { onRunStart?: (run: Run) => void }) {
   const [jobId, setJobId] = useState<number>(0);
   const [featureRequest, setFeatureRequest] = useState('');
   const [files, setFiles] = useState('');
@@ -12,6 +13,7 @@ export function ContextBuilder({ onRunStart }: { onRunStart: (run: Run) => void 
   const [extraNotes, setExtraNotes] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const { startRun } = useRunContext();
 
   const { data: jobs } = useQuery({ queryKey: ['jobs'], queryFn: api.jobs.list });
 
@@ -30,7 +32,12 @@ export function ContextBuilder({ onRunStart }: { onRunStart: (run: Run) => void 
         extra_notes: extraNotes,
       };
       const run = await api.runs.start(jobId, featureRequest, context);
-      onRunStart(run);
+      // Use context to start the run (persists across navigation)
+      startRun(run);
+      // Also call the prop callback if provided (for backward compatibility)
+      if (onRunStart) {
+        onRunStart(run);
+      }
     } catch (e) {
       setError((e as Error).message);
     }

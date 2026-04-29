@@ -151,7 +151,7 @@ class Orchestrator:
         await self._update_status(phase_name)
 
         try:
-            result = runner.run(task, system_prompt=system_prompt)
+            result = await runner.run(task, system_prompt=system_prompt)
         except OpenCodeAgentError as e:
             latency_ms = int((time.time() - start) * 1000)
             error_msg = str(e)

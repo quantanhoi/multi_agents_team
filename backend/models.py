@@ -61,6 +61,7 @@ class JobUpdate(BaseModel):
     agent_overrides: Optional[dict] = None
     loop_mode: Optional[str] = None
     max_iterations: Optional[int] = None
+    definition_of_done: Optional[str] = None
 
 class JobResponse(BaseModel):
     id: int

@@ -10,6 +10,10 @@ services:
       - ${PROJECT_DIR:-./projects}:/workspace
     environment:
       - OLLAMA_ENDPOINT=${OLLAMA_ENDPOINT:-http://host.docker.internal:11435}
+      - OLLAMA_API=${OLLAMA_API:-}
+      - GIT_USER_NAME=${GIT_USER_NAME:-Multi-Agent Bot}
+      - GIT_USER_EMAIL=${GIT_USER_EMAIL:-agent@multi-agent-studio.ai}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

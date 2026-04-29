@@ -41,8 +41,11 @@ class OpenCodeAgentRunner:
         self.max_budget_usd = max_budget_usd
         self.model = model
 
-    def run(self, prompt: str, system_prompt: Optional[str] = None) -> dict:
-        """Run OpenCode with a prompt and return structured output.
+    async def run(self, prompt: str, system_prompt: Optional[str] = None) -> dict:
+        """Run OpenCode asynchronously (non-blocking) and return structured output.
+
+        Runs the blocking subprocess call in a thread pool so the FastAPI event loop
+        remains responsive to other requests during LLM execution.
 
         Args:
             prompt: The user prompt to send to OpenCode
@@ -57,41 +60,44 @@ class OpenCodeAgentRunner:
             full_prompt = f"{system_prompt}\n\n{prompt}"
 
         try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+
             # Build OpenCode command
-            # Note: opencode uses `run` subcommand for non-interactive execution.
-            # The `-p` flag in opencode is `--password`, not print mode.
-            # Flags preserved from Claude Agent that opencode supports:
-            #   --dangerously-skip-permissions
-            # Flags removed because unsupported by opencode:
-            #   --bare
-            #   --allowed-tools
-            #   --output-format (opencode has --format default|json, omitted)
-            #   --max-budget-usd
             cmd = [
                 "opencode",
                 "run",
-                "--dangerously-skip-permissions",  # Auto-approve permissions
+                "--dangerously-skip-permissions",
             ]
-
             if self.model:
                 cmd.extend(["--model", self.model])
+            cmd.append(full_prompt)
 
-            # Run OpenCode in the worktree with prompt as a positional arg
-            result = subprocess.run(
-                cmd + [full_prompt],
-                cwd=str(self.worktree_path),
-                capture_output=True,
-                text=True,
-                timeout=600,  # 10 minute timeout
-                env={
-                    **os.environ,
-                    "OPENCODE_SIMPLE": "1",
-                },
+            proc_env = {
+                **os.environ,
+                "OPENCODE_ROLE": self.role,
+                "OPENCODE_WORKTREE": str(self.worktree_path),
+                "OPENCODE_BASE_DIR": str(self.worktree_path),
+            }
+
+            # Run in executor (thread pool) so event loop stays responsive
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        cmd,
+                        cwd=str(self.worktree_path),
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                        env=proc_env,
+                    ),
+                ),
+                timeout=610,
             )
 
-            # Parse output
-            output = result.stdout
-            stderr = result.stderr
+            output = result.stdout or ""
+            stderr = result.stderr or ""
 
             # Extract any JSON from the output
             structured_output = self._extract_json(output)
@@ -111,6 +117,10 @@ class OpenCodeAgentRunner:
 
         except subprocess.TimeoutExpired:
             raise OpenCodeAgentError("OpenCode timed out after 10 minutes")
+        except asyncio.TimeoutError:
+            raise OpenCodeAgentError("OpenCode timed out after 10 minutes")
+        except OpenCodeAgentError:
+            raise
         except Exception as e:
             raise OpenCodeAgentError(f"Failed to run OpenCode: {e}")
 

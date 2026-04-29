@@ -1,36 +1,47 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
-import { Run, RunStatus, RunStep, HumanInputRequest, WSMessage } from '../types';
+import { useRef, useEffect, useCallback } from 'react';
+import { RunStatus, RunStep, Run, WSMessage } from '../types';
 import { api } from '../api';
+import { useRunContext } from '../context/RunContext';
 import { ContextBuilder } from '../components/ContextBuilder';
 import { PhaseTimeline } from '../components/PhaseTimeline';
 import ActiveStepPanel from '../components/ActiveStepPanel';
 import HistoryPanel from '../components/HistoryPanel';
 import HumanInputPanel from '../components/HumanInputPanel';
 
-type RunState = 'idle' | 'running' | 'waiting' | 'done';
-
 export function RunPage() {
-  const [state, setState] = useState<RunState>('idle');
-  const [runId, setRunId] = useState<number | null>(null);
-  const [currentPhase, setCurrentPhase] = useState<RunStatus>('pending');
-  const [completedPhases, setCompletedPhases] = useState<RunStatus[]>([]);
-  const [errors, setErrors] = useState<{phase: string; message: string}[]>([]);
-
-  // New state for the restructured layout
-  const [steps, setSteps] = useState<RunStep[]>([]);
-  const [activeStep, setActiveStep] = useState<Partial<RunStep> & { model?: string }>({});
-  const [streamBuffer, setStreamBuffer] = useState('');
-  const [humanRequest, setHumanRequest] = useState<HumanInputRequest | null>(null);
+  const {
+    runState,
+    runId,
+    currentPhase,
+    completedPhases,
+    errors,
+    steps,
+    activeStep,
+    streamBuffer,
+    humanRequest,
+    startRun,
+    stopRun,
+    setRunState,
+    setCurrentPhase,
+    setCompletedPhases,
+    setSteps,
+    setActiveStep,
+    setStreamBuffer,
+    setHumanRequest,
+    appendStream,
+    appendError,
+    addStep,
+  } = useRunContext();
 
   // Refs to keep latest values accessible in WS handlers without stale closures
   const stepsRef = useRef<RunStep[]>([]);
   const activeStepRef = useRef<Partial<RunStep> & { model?: string }>({});
   const streamBufferRef = useRef('');
+  const phasesRef = useRef<{ current: RunStatus; completed: RunStatus[] }>({ current: 'pending', completed: [] });
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
-  const phasesRef = useRef<{ current: RunStatus; completed: RunStatus[] }>({ current: 'pending', completed: [] });
 
   const allPhases: RunStatus[] = ['planning_draft', 'planning_review_coder', 'planning_review_tester', 'planning_finalize', 'coding', 'testing', 'evaluating'];
 
@@ -41,21 +52,24 @@ export function RunPage() {
     }
   }, []);
 
-  const syncDisplay = () => {
+  // Sync display from refs when state changes
+  const syncDisplay = useCallback(() => {
     setSteps([...stepsRef.current]);
     setActiveStep({ ...activeStepRef.current });
     setStreamBuffer(streamBufferRef.current);
-  };
+  }, [setSteps, setActiveStep, setStreamBuffer]);
 
-  const finalizeActiveStep = () => {
+  const finalizeActiveStep = useCallback(() => {
     if (activeStepRef.current.step_number !== undefined) {
       stepsRef.current.push(activeStepRef.current as RunStep);
+      addStep(activeStepRef.current as RunStep);
     }
     activeStepRef.current = {};
     streamBufferRef.current = '';
     syncDisplay();
-  };
+  }, [addStep, syncDisplay]);
 
+  // ── WebSocket connection ─────────────────────────────────────────
   const connectWS = useCallback((targetRunId: number) => {
     clearReconnect();
     const apiBase = (import.meta as any).env?.VITE_API_BASE_URL || '';
@@ -77,7 +91,7 @@ export function RunPage() {
     ws.onclose = () => {
       wsRef.current = null;
       // Auto-reconnect with exponential backoff (max 30s) unless run is done/failed
-      if (state !== 'done' && targetRunId) {
+      if (runState !== 'done' && targetRunId) {
         const delay = Math.min(1000 * 2 ** reconnectAttemptRef.current, 30000);
         reconnectAttemptRef.current += 1;
         reconnectTimeoutRef.current = setTimeout(() => connectWS(targetRunId), delay);
@@ -87,9 +101,43 @@ export function RunPage() {
     ws.onerror = () => {
       // onclose handles reconnection
     };
-  }, [clearReconnect, state]);
+  }, [clearReconnect, runState]);
 
-  const handleWSMessage = (msg: WSMessage) => {
+  // ── Fetch existing run state on mount ───────────────────────────
+  useEffect(() => {
+    // If we return to this page and there's an active run, reconnect WS
+    if (runId && (runState === 'running' || runState === 'waiting')) {
+      // Re-establish websocket
+      connectWS(runId);
+      // Optionally re-fetch steps from backend to sync history
+      api.runs.getSteps(runId).then((backendSteps) => {
+        if (backendSteps && backendSteps.length > stepsRef.current.length) {
+          stepsRef.current = backendSteps;
+          setSteps(backendSteps);
+        }
+      }).catch(() => {
+        // Ignore fetch errors
+      });
+    }
+
+    return () => {
+      // DO NOT close WS or clear reconnect on unmount — we want to stay connected across navigation
+      // Only cleanup when the component is truly unmounting (e.g. app close) is handled below
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Run once on mount
+
+  // Cleanup on app unload
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      clearReconnect();
+      wsRef.current?.close();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [clearReconnect]);
+
+  const handleWSMessage = useCallback((msg: WSMessage) => {
     const p = phasesRef.current;
     switch (msg.type) {
       case 'phase_change':
@@ -121,6 +169,7 @@ export function RunPage() {
         if (msg.agent || msg.phase) {
           const text = typeof msg.output === 'string' ? msg.output : JSON.stringify(msg.output);
           streamBufferRef.current += text;
+          appendStream(text);
           activeStepRef.current = {
             ...activeStepRef.current,
             agent: msg.agent || activeStepRef.current.agent,
@@ -135,11 +184,11 @@ export function RunPage() {
         break;
       case 'phase_error':
         if (msg.phase && msg.message) {
-          setErrors(prev => [...prev, { phase: msg.phase!, message: msg.message! }]);
+          appendError(msg.phase, msg.message);
         }
         break;
       case 'human_input_required':
-        setState('waiting');
+        setRunState('waiting');
         setHumanRequest({
           message: msg.message!,
           requested_by: msg.requested_by!,
@@ -150,18 +199,18 @@ export function RunPage() {
         if (p.current && !p.completed.includes(p.current)) p.completed.push(p.current);
         setCompletedPhases([...p.completed]);
         setCurrentPhase('done');
-        setState('done');
+        setRunState('done');
         finalizeActiveStep();
         clearReconnect();
         break;
       case 'failed':
         setCurrentPhase('failed');
-        setState('done');
+        setRunState('done');
         finalizeActiveStep();
         clearReconnect();
         break;
     }
-  };
+  }, [setCurrentPhase, setCompletedPhases, setRunState, setHumanRequest, appendError, appendStream, finalizeActiveStep, clearReconnect, syncDisplay]);
 
   const sendOverride = useCallback((text: string) => {
     if (!runId || !text.trim()) return;
@@ -170,35 +219,22 @@ export function RunPage() {
     // TODO: send to backend once override endpoint is available
   }, [runId]);
 
-  const onRunStart = (run: Run) => {
-    setRunId(run.id);
+  const onRunStart = useCallback((run: Run) => {
+    // Reset phases ref
     phasesRef.current = { current: 'pending', completed: [] };
-    setCompletedPhases([]);
-    setCurrentPhase('pending');
     stepsRef.current = [];
     activeStepRef.current = {};
     streamBufferRef.current = '';
-    setSteps([]);
-    setActiveStep({});
-    setStreamBuffer('');
-    setErrors([]);
-    setHumanRequest(null);
-    setState('running');
-    connectWS(run.id);
-  };
 
-  useEffect(() => {
-    return () => {
-      clearReconnect();
-      wsRef.current?.close();
-    };
-  }, [clearReconnect]);
+    startRun(run);
+    connectWS(run.id);
+  }, [startRun, connectWS]);
 
   return (
     <div>
-      {state === 'idle' && <ContextBuilder onRunStart={onRunStart} />}
+      {runState === 'idle' && <ContextBuilder onRunStart={onRunStart} />}
 
-      {(state === 'running' || state === 'waiting' || state === 'done') && (
+      {(runState === 'running' || runState === 'waiting' || runState === 'done') && (
         <div className="space-y-4">
           <PhaseTimeline currentPhase={currentPhase} completedPhases={completedPhases} allPhases={allPhases} />
 
@@ -217,26 +253,30 @@ export function RunPage() {
 
           <HumanInputPanel
             request={humanRequest ? { message: humanRequest.message, input_type: humanRequest.input_type } : null}
-            onSubmit={(text) => {
+            onSubmit={(text: string) => {
               if (!runId) return;
               api.runs.resume(runId, { response_text: text, uploaded_files: [] });
               setHumanRequest(null);
-              setState('running');
+              setRunState('running');
             }}
           />
         </div>
       )}
 
-      {state === 'done' && (
+      {runState === 'done' && (
         <div className="mt-4 p-4 bg-green-50 rounded-lg">
           <p className="font-semibold text-green-800">
             {currentPhase === 'done' ? 'Run completed successfully!' : 'Run failed.'}
           </p>
-          <button onClick={() => {
-            clearReconnect();
-            setState('idle');
-            setRunId(null);
-          }} className="mt-2 px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">Start New Run</button>
+          <button
+            onClick={() => {
+              clearReconnect();
+              stopRun();
+            }}
+            className="mt-2 px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700"
+          >
+            Start New Run
+          </button>
         </div>
       )}
     </div>

@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""
+opencode fallback CLI for multi-agent orchestrator.
+
+Calls Ollama Cloud API directly and handles file writes from JSON responses.
+
+Usage:
+    OPENCODE_ROLE=coder opencode run --model <model> <prompt>
+"""
+
+import sys
+import os
+import json
+import re
+import subprocess
+import argparse
+
+OLLAMA_API_URL = os.environ.get('OLLAMA_ENDPOINT', 'https://ollama.com')
+OLLAMA_API_KEY = os.environ.get('OLLAMA_API', '')
+ROLE = os.environ.get('OPENCODE_ROLE', 'assistant')
+try:
+    _DEFAULT_CWD = os.getcwd()
+except FileNotFoundError:
+    _DEFAULT_CWD = os.environ.get('OPENCODE_WORKTREE', '/workspace')
+
+WORKTREE_PATH = os.environ.get('OPENCODE_WORKTREE', _DEFAULT_CWD)
+
+# Force-load /app/.env overrides so container env does not win
+_ENV_FILE = '/app/.env'
+if os.path.isfile(_ENV_FILE):
+    try:
+        with open(_ENV_FILE) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith('#') and '=' in _line:
+                    _k, _v = _line.split('=', 1)
+                    os.environ[_k] = _v
+        OLLAMA_API_URL = os.environ.get('OLLAMA_ENDPOINT', OLLAMA_API_URL)
+        OLLAMA_API_KEY = os.environ.get('OLLAMA_API', OLLAMA_API_KEY)
+    except Exception:
+        pass
+
+
+def load_init_context():
+    """Load init.md from the project root if available."""
+    # Walk up from worktree path to find init.md
+    base = os.environ.get('OPENCODE_BASE_DIR', WORKTREE_PATH)
+    paths = [
+        os.path.join(base, 'init.md'),
+        os.path.join(base, '..', 'init.md'),
+        os.path.join(os.path.dirname(base), 'init.md'),
+        '/workspace/init.md',
+        '/home/edward/github/thanh_portfolio_test/init.md',
+    ]
+    for p in paths:
+        p = os.path.abspath(p)
+        if os.path.isfile(p):
+            try:
+                with open(p, 'r') as f:
+                    return f.read()
+            except Exception:
+                continue
+    return ""
+
+
+def call_ollama(prompt: str, model: str, system: str = ""):
+    """Call Ollama /api/chat endpoint using urllib (no extra deps)."""
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    
+    payload = {"model": model, "messages": messages, "stream": False}
+    
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            f"{OLLAMA_API_URL}/api/chat",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method='POST'
+        )
+        if OLLAMA_API_KEY:
+            req.add_header("Authorization", f"Bearer {OLLAMA_API_KEY}")
+        
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            data = json.loads(resp.read().decode())
+            return data.get("message", {}).get("content", data.get("content", ""))
+    except Exception as e:
+        print(f"[opencode-fallback] Error calling Ollama: {e}", file=sys.stderr)
+        return json.dumps({
+            "error": str(e),
+            "human_input_request": {
+                "requested_by": "system",
+                "message": f"Ollama endpoint at {OLLAMA_API_URL} unreachable: {e}",
+                "input_type": "text"
+            }
+        })
+
+
+def extract_files_from_json(data):
+    """Extract file writes from JSON patch_or_full_files or files_changed arrays."""
+    written = []
+
+    # Handle string (already parsed earlier in main)
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            return written
+
+    if not isinstance(data, dict):
+        return written
+
+    # Field names from system prompts
+    file_keys = [
+        'patch_or_full_files',
+        'files_changed',
+        'files_to_change',
+    ]
+
+    for key in file_keys:
+        arr = data.get(key)
+        if not isinstance(arr, list):
+            continue
+        for entry in arr:
+            if isinstance(entry, dict):
+                fpath = entry.get('path')
+                content = entry.get('content')
+                if fpath and isinstance(content, str):
+                    try:
+                        cwd = WORKTREE_PATH
+                    except Exception:
+                        cwd = os.environ.get('OPENCODE_WORKTREE', '/workspace')
+                    full = os.path.join(cwd, fpath)
+                    os.makedirs(os.path.dirname(full), exist_ok=True)
+                    with open(full, 'w') as f:
+                        f.write(content)
+                    written.append(fpath)
+                    print(f"[opencode-fallback] Wrote: {fpath}", file=sys.stderr)
+            elif isinstance(entry, str):
+                # Just a filename list, try to find content in parent object
+                # This shouldn't happen with our prompts, but handle gracefully
+                pass
+
+    return written
+
+
+def write_files_from_markdown(text: str):
+    """Attempt to extract and write files from markdown code blocks."""
+    pattern = re.compile(r'```(\w+)?\n(.*?)\n```', re.DOTALL)
+    matches = pattern.findall(text)
+    
+    written = []
+    for lang, code in matches:
+        # For JSON blocks: parse and extract files instead of writing .json file
+        if lang == 'json':
+            try:
+                parsed = json.loads(code.strip())
+                if isinstance(parsed, dict):
+                    files = extract_files_from_json(parsed)
+                    written.extend(files)
+                    continue
+            except json.JSONDecodeError:
+                pass
+        
+        lines = code.strip().split('\n')
+        if not lines:
+            continue
+        first = lines[0]
+        fname = None
+        for prefix in ('# File:', '// File:', '# FILE:', '/* File:'):
+            if prefix in first:
+                fname = first.split(prefix)[-1].strip().strip('*/#').strip()
+                break
+        if not fname:
+            if lang in ('html', 'htm'):
+                fname = 'index.html'
+            elif lang in ('python', 'py'):
+                fname = 'main.py'
+            elif lang in ('jsx', 'tsx', 'react') or ('import React' in code):
+                fname = 'App.jsx'
+            elif lang in ('css', 'tailwind'):
+                fname = 'index.css'
+            elif lang in ('js', 'javascript'):
+                fname = 'app.js'
+            elif lang in ('sql',):
+                fname = 'schema.sql'
+            else:
+                # Unknown language — skip unless a # File: comment exists
+                fname = None
+                # Try to find filename in the block anyway
+                for line in lines[:3]:
+                    for prefix in ('# File:', '// File:', '# FILE:', '/* File:'):
+                        if prefix in line:
+                            fname = line.split(prefix)[-1].strip().strip('*/#').strip()
+                            break
+                    if fname:
+                        break
+                if not fname:
+                    continue
+        
+        if '# File:' in first or '// File:' in first or '# FILE:' in first or '/* File:' in first:
+            code = '\n'.join(lines[1:])
+        
+        full = os.path.join(WORKTREE_PATH, fname)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, 'w') as f:
+            f.write(code)
+        written.append(fname)
+        print(f"[opencode-fallback] Wrote (markdown): {fname}", file=sys.stderr)
+    
+    return written
+
+
+def git_stage_files(files: list):
+    """Stage files for commit (commit happens in orchestrator)."""
+    for f in files:
+        try:
+            subprocess.run(['git', 'add', f], capture_output=True, cwd=WORKTREE_PATH)
+        except FileNotFoundError:
+            # git not installed — skip staging, orchestrator will handle it
+            pass
+    print(f"[opencode-fallback] Staged {len(files)} file(s)", file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', nargs='?', default='run')
+    parser.add_argument('--model', default='glm-5.1')
+    parser.add_argument('--dangerously-skip-permissions', action='store_true')
+    parser.add_argument('prompt_parts', nargs='*')
+    args = parser.parse_args()
+    
+    prompt = ' '.join(args.prompt_parts) if args.prompt_parts else sys.stdin.read()
+    model = args.model
+    
+    # Load init.md context
+    init_ctx = load_init_context()
+    if init_ctx:
+        print(f"[opencode-fallback] Loaded init.md ({len(init_ctx)} chars)", file=sys.stderr)
+    
+    # Role-based system prompt — uses ROLE env var, NOT model name
+    if ROLE == 'planner':
+        system = (
+            "You are the planner. Your job is to break work into small phases and produce a roadmap. "
+            "Do not write code. "
+            "Return JSON only with: goal, roadmap (array of phases with name, tasks, definition_of_done for both coder and tester), files_needed, risks, human_input_request (null or object)."
+        )
+        if init_ctx:
+            system += f"\n\nProject context from init.md:\n{init_ctx[:4000]}"
+    elif ROLE == 'coder':
+        system = (
+            "You are the coder. Write or edit code only from the approved plan. "
+            "Do not change unrelated files. "
+            "Return JSON only with: summary, files_changed, patch_or_full_files (array of {{path, content}}), notes_for_tester, human_input_request (null or object). "
+            "IMPORTANT: For each file, you MUST provide:\n"
+            '  patch_or_full_files: [\n'
+            '    {{"path": "relative/path.py", "content": "full file content here"}},\n'
+            '    {{"path": "relative/path.css", "content": "full file content here"}}\n'
+            '  ]'
+        )
+        if init_ctx:
+            system += f"\n\nProject context from init.md:\n{init_ctx[:4000]}"
+    elif ROLE == 'tester':
+        system = (
+            "You are the tester. Review the code and test outputs. "
+            "Find bugs, edge cases, and missing tests. "
+            "Return JSON only with: status (pass|fail), bugs (array of {{severity, description, file}}), definition_of_done_check (for_coder, for_tester), manual_test_checklist, automation_gaps, next_action (fix_bugs|continue|done), human_input_request (null or object)."
+        )
+    else:
+        system = "You are an AI assistant. Provide helpful JSON responses."
+    
+    print(f"[opencode-fallback] role={ROLE}, model={model}, url={OLLAMA_API_URL}", file=sys.stderr)
+    
+    try:
+        content = call_ollama(prompt, model, system)
+    except KeyboardInterrupt:
+        sys.exit(1)
+    
+    # Try parse JSON output
+    parsed = None
+    is_json = False
+    try:
+        parsed = json.loads(content)
+        is_json = True
+    except json.JSONDecodeError:
+        pass
+    
+    written = []
+    if is_json and isinstance(parsed, dict):
+        # Valid JSON — try to extract files from patch_or_full_files, etc.
+        written = extract_files_from_json(parsed)
+        if written:
+            git_stage_files(written)
+        # Print the JSON output for orchestrator
+        print(json.dumps({
+            **parsed,
+            "files_changed": written or parsed.get('files_changed', []),
+            "summary": parsed.get('summary', '') or f"Generated {len(written)} file(s): {written}",
+        }))
+    else:
+        # Not valid JSON — try markdown code blocks
+        written = write_files_from_markdown(content)
+        if written:
+            git_stage_files(written)
+        output = {
+            "raw_output": content[:4000],
+            "files_changed": written,
+            "human_input_request": None,
+            "summary": f"Generated {len(written)} file(s): {written}"
+        }
+        print(json.dumps(output, indent=2))
+
+
+if __name__ == '__main__':
+    main()
