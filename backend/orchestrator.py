@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from database import DB_PATH
 from websocket import ws_manager
-from claude_agent import ClaudeAgentRunner, ClaudeAgentError
+from opencode_agent import OpenCodeAgentRunner, OpenCodeAgentError
 from worktree_manager import WorktreeManager
 import aiosqlite
 
@@ -24,9 +24,9 @@ class Orchestrator:
         try:
             # Verify Claude Code CLI is available
             import shutil
-            if not shutil.which("claude"):
+            if not shutil.which("opencode"):
                 raise RuntimeError(
-                    "Claude Code CLI not found. Install it first: npm install -g @anthropic-ai/claude-code"
+                    "OpenCode CLI not found. Install it first: npm install -g opencode"
                 )
 
             # Initialize worktrees for each agent
@@ -36,7 +36,7 @@ class Orchestrator:
             # Create worktrees and agent runners
             for role in ["planner", "coder", "tester"]:
                 wt_path = self._worktree_manager.create_worktree(role)
-                self._agents[role] = ClaudeAgentRunner(
+                self._agents[role] = OpenCodeAgentRunner(
                     worktree_path=str(wt_path),
                     role=role,
                     allowed_tools=["Bash", "Read", "Edit", "Write", "Agent"],
@@ -66,7 +66,7 @@ class Orchestrator:
             await self._update_status("done")
             await self._broadcast({"type": "done", "status": "done", "summary": "All phases complete", "roadmap": result})
             return result
-        except ClaudeAgentError as e:
+        except OpenCodeAgentError as e:
             await self._update_status("failed")
             await self._broadcast({"type": "failed", "status": "failed", "message": str(e)})
             raise
@@ -248,7 +248,7 @@ Produce a phased roadmap with definition_of_done per phase. Return JSON with: go
             try:
                 agent = self._agents.get(role)
                 if not agent:
-                    raise ClaudeAgentError(f"No agent configured for role: {role}")
+                    raise OpenCodeAgentError(f"No agent configured for role: {role}")
 
                 result = agent.run(user_prompt, system_prompt=system_prompt)
                 latency_ms = int((time.time() - start) * 1000)
@@ -266,7 +266,7 @@ Produce a phased roadmap with definition_of_done per phase. Return JSON with: go
 
                 await self._save_step(phase, role, json.dumps({"system": system_prompt, "user": user_prompt}), json.dumps(output), latency_ms, None)
                 return output, None
-            except ClaudeAgentError as e:
+            except OpenCodeAgentError as e:
                 latency_ms = int((time.time() - start) * 1000)
                 error_msg = str(e)
                 await self._save_step(phase, role, json.dumps({"system": system_prompt, "user": user_prompt}), None, latency_ms, error_msg)

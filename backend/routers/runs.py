@@ -6,7 +6,7 @@ from database import DB_PATH
 from models import RunStart, RunResponse, HumanResponse
 from orchestrator import Orchestrator
 from websocket import ws_manager
-from claude_agent import ClaudeAgentError
+from opencode_agent import OpenCodeAgentError
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 

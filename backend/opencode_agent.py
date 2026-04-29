@@ -1,24 +1,23 @@
-"""Claude Code CLI agent runner.
+"""OpenCode CLI agent runner.
 
-Replaces raw LLM API calls with Claude Code CLI execution in isolated git worktrees.
-Each agent runs Claude Code with a prompt and captures the output.
+Replaces raw LLM API calls with OpenCode CLI execution in isolated git worktrees.
+Each agent runs OpenCode with a prompt and captures the output.
 """
 
 import os
 import subprocess
 import json
-import tempfile
 from pathlib import Path
 from typing import Optional
 
 
-class ClaudeAgentError(Exception):
-    """Error running Claude Code agent."""
+class OpenCodeAgentError(Exception):
+    """Error running OpenCode agent."""
     pass
 
 
-class ClaudeAgentRunner:
-    """Runs Claude Code CLI as an agent in a specific worktree."""
+class OpenCodeAgentRunner:
+    """Runs OpenCode CLI as an agent in a specific worktree."""
 
     def __init__(
         self,
@@ -26,9 +25,12 @@ class ClaudeAgentRunner:
         role: str,
         allowed_tools: Optional[list] = None,
         max_budget_usd: Optional[float] = None,
+        model: Optional[str] = None,
     ):
         self.worktree_path = Path(worktree_path)
         self.role = role
+        # allowed_tools and max_budget_usd are kept for API compatibility but
+        # are not passed to opencode (not supported by the CLI).
         self.allowed_tools = allowed_tools or [
             "Bash",
             "Read",
@@ -37,12 +39,13 @@ class ClaudeAgentRunner:
             "Agent",
         ]
         self.max_budget_usd = max_budget_usd
+        self.model = model
 
     def run(self, prompt: str, system_prompt: Optional[str] = None) -> dict:
-        """Run Claude Code with a prompt and return structured output.
+        """Run OpenCode with a prompt and return structured output.
 
         Args:
-            prompt: The user prompt to send to Claude Code
+            prompt: The user prompt to send to OpenCode
             system_prompt: Optional system prompt to prepend
 
         Returns:
@@ -54,32 +57,35 @@ class ClaudeAgentRunner:
             full_prompt = f"{system_prompt}\n\n{prompt}"
 
         try:
-            # Build Claude Code command
+            # Build OpenCode command
+            # Note: opencode uses `run` subcommand for non-interactive execution.
+            # The `-p` flag in opencode is `--password`, not print mode.
+            # Flags preserved from Claude Agent that opencode supports:
+            #   --dangerously-skip-permissions
+            # Flags removed because unsupported by opencode:
+            #   --bare
+            #   --allowed-tools
+            #   --output-format (opencode has --format default|json, omitted)
+            #   --max-budget-usd
             cmd = [
-                "claude",
-                "-p",  # Print mode (non-interactive)
-                "--dangerously-skip-permissions",  # Skip permission prompts
-                "--bare",  # Minimal mode
-                "--allowed-tools",
-                ",".join(self.allowed_tools),
-                "--output-format",
-                "text",
+                "opencode",
+                "run",
+                "--dangerously-skip-permissions",  # Auto-approve permissions
             ]
 
-            if self.max_budget_usd:
-                cmd.extend(["--max-budget-usd", str(self.max_budget_usd)])
+            if self.model:
+                cmd.extend(["--model", self.model])
 
-            # Run Claude Code in the worktree with prompt via stdin
+            # Run OpenCode in the worktree with prompt as a positional arg
             result = subprocess.run(
-                cmd,
+                cmd + [full_prompt],
                 cwd=str(self.worktree_path),
-                input=full_prompt,
                 capture_output=True,
                 text=True,
                 timeout=600,  # 10 minute timeout
                 env={
                     **os.environ,
-                    "CLAUDE_CODE_SIMPLE": "1",
+                    "OPENCODE_SIMPLE": "1",
                 },
             )
 
@@ -104,12 +110,12 @@ class ClaudeAgentRunner:
             }
 
         except subprocess.TimeoutExpired:
-            raise ClaudeAgentError("Claude Code timed out after 10 minutes")
+            raise OpenCodeAgentError("OpenCode timed out after 10 minutes")
         except Exception as e:
-            raise ClaudeAgentError(f"Failed to run Claude Code: {e}")
+            raise OpenCodeAgentError(f"Failed to run OpenCode: {e}")
 
     def _extract_json(self, text: str) -> Optional[dict]:
-        """Try to extract JSON from Claude Code output."""
+        """Try to extract JSON from OpenCode output."""
         import re
 
         # Look for JSON code blocks
@@ -152,10 +158,23 @@ class ClaudeAgentRunner:
 
         return files
 
-    def read_history(self, n: int = 5) -> str:
+    def read_git_history(self, n: int = 5) -> str:
         """Read recent git history for context."""
         result = subprocess.run(
             ["git", "log", "--oneline", "-n", str(n)],
+            cwd=str(self.worktree_path),
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout if result.returncode == 0 else ""
+
+    # Backwards-compatible alias for read_git_history
+    read_history = read_git_history
+
+    def get_git_diff(self, since_ref: str) -> str:
+        """Get git diff since a specific reference."""
+        result = subprocess.run(
+            ["git", "diff", since_ref],
             cwd=str(self.worktree_path),
             capture_output=True,
             text=True,
