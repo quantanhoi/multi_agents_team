@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Run, RunStatus, WSMessage } from '../types';
+import { Run, RunStatus, RunStep, HumanInputRequest, WSMessage } from '../types';
 import { api } from '../api';
 import { ContextBuilder } from '../components/ContextBuilder';
 import { PhaseTimeline } from '../components/PhaseTimeline';
-import { OutputPanels, AgentOutput } from '../components/OutputPanels';
-import { HumanInputModal } from '../components/HumanInputModal';
+import ActiveStepPanel from '../components/ActiveStepPanel';
+import HistoryPanel from '../components/HistoryPanel';
+import HumanInputPanel from '../components/HumanInputPanel';
 
 type RunState = 'idle' | 'running' | 'waiting' | 'done';
 
@@ -13,9 +14,19 @@ export function RunPage() {
   const [runId, setRunId] = useState<number | null>(null);
   const [currentPhase, setCurrentPhase] = useState<RunStatus>('pending');
   const [completedPhases, setCompletedPhases] = useState<RunStatus[]>([]);
-  const [agentOutputs, setAgentOutputs] = useState<AgentOutput[]>([]);
   const [errors, setErrors] = useState<{phase: string; message: string}[]>([]);
-  const [humanRequest, setHumanRequest] = useState<{ message: string; requested_by: string; input_type: string } | null>(null);
+
+  // New state for the restructured layout
+  const [steps, setSteps] = useState<RunStep[]>([]);
+  const [activeStep, setActiveStep] = useState<Partial<RunStep> & { model?: string }>({});
+  const [streamBuffer, setStreamBuffer] = useState('');
+  const [humanRequest, setHumanRequest] = useState<HumanInputRequest | null>(null);
+
+  // Refs to keep latest values accessible in WS handlers without stale closures
+  const stepsRef = useRef<RunStep[]>([]);
+  const activeStepRef = useRef<Partial<RunStep> & { model?: string }>({});
+  const streamBufferRef = useRef('');
+
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
@@ -29,6 +40,21 @@ export function RunPage() {
       reconnectTimeoutRef.current = null;
     }
   }, []);
+
+  const syncDisplay = () => {
+    setSteps([...stepsRef.current]);
+    setActiveStep({ ...activeStepRef.current });
+    setStreamBuffer(streamBufferRef.current);
+  };
+
+  const finalizeActiveStep = () => {
+    if (activeStepRef.current.step_number !== undefined) {
+      stepsRef.current.push(activeStepRef.current as RunStep);
+    }
+    activeStepRef.current = {};
+    streamBufferRef.current = '';
+    syncDisplay();
+  };
 
   const connectWS = useCallback((targetRunId: number) => {
     clearReconnect();
@@ -74,17 +100,37 @@ export function RunPage() {
           p.current = msg.phase as RunStatus;
           setCurrentPhase(msg.phase as RunStatus);
           setCompletedPhases([...p.completed]);
+
+          // Finalize previous active step before starting new one
+          finalizeActiveStep();
+
+          activeStepRef.current = {
+            step_number: msg.step_number,
+            agent: msg.role || msg.agent,
+            step_type: msg.phase,
+            model: msg.model,
+            output: {},
+            files_changed: [],
+            created_at: new Date().toISOString(),
+          };
+          streamBufferRef.current = '';
+          syncDisplay();
         }
         break;
       case 'agent_output':
-        if (msg.phase && msg.agent) {
-          setAgentOutputs(prev => [...prev, {
-            phase: msg.phase!,
-            agent: msg.agent!,
-            output: msg.output,
-            error: msg.error,
-            timestamp: Date.now(),
-          }]);
+        if (msg.agent || msg.phase) {
+          const text = typeof msg.output === 'string' ? msg.output : JSON.stringify(msg.output);
+          streamBufferRef.current += text;
+          activeStepRef.current = {
+            ...activeStepRef.current,
+            agent: msg.agent || activeStepRef.current.agent,
+            step_type: msg.phase || activeStepRef.current.step_type,
+            output: {
+              ...activeStepRef.current.output,
+              raw_output: (activeStepRef.current.output?.raw_output || '') + text,
+            },
+          };
+          syncDisplay();
         }
         break;
       case 'phase_error':
@@ -94,29 +140,47 @@ export function RunPage() {
         break;
       case 'human_input_required':
         setState('waiting');
-        setHumanRequest({ message: msg.message!, requested_by: msg.requested_by!, input_type: msg.input_type || 'text' });
+        setHumanRequest({
+          message: msg.message!,
+          requested_by: msg.requested_by!,
+          input_type: (msg.input_type as any) || 'text',
+        });
         break;
       case 'done':
         if (p.current && !p.completed.includes(p.current)) p.completed.push(p.current);
         setCompletedPhases([...p.completed]);
         setCurrentPhase('done');
         setState('done');
+        finalizeActiveStep();
         clearReconnect();
         break;
       case 'failed':
         setCurrentPhase('failed');
         setState('done');
+        finalizeActiveStep();
         clearReconnect();
         break;
     }
   };
+
+  const sendOverride = useCallback((text: string) => {
+    if (!runId || !text.trim()) return;
+    // eslint-disable-next-line no-console
+    console.log('Override for run', runId, ':', text);
+    // TODO: send to backend once override endpoint is available
+  }, [runId]);
 
   const onRunStart = (run: Run) => {
     setRunId(run.id);
     phasesRef.current = { current: 'pending', completed: [] };
     setCompletedPhases([]);
     setCurrentPhase('pending');
-    setAgentOutputs([]);
+    stepsRef.current = [];
+    activeStepRef.current = {};
+    streamBufferRef.current = '';
+    setSteps([]);
+    setActiveStep({});
+    setStreamBuffer('');
     setErrors([]);
     setHumanRequest(null);
     setState('running');
@@ -135,11 +199,11 @@ export function RunPage() {
       {state === 'idle' && <ContextBuilder onRunStart={onRunStart} />}
 
       {(state === 'running' || state === 'waiting' || state === 'done') && (
-        <div>
+        <div className="space-y-4">
           <PhaseTimeline currentPhase={currentPhase} completedPhases={completedPhases} allPhases={allPhases} />
 
           {errors.length > 0 && (
-            <div className="mb-4 p-3 bg-red-50 rounded-lg border border-red-200">
+            <div className="p-3 bg-red-50 rounded-lg border border-red-200">
               <h4 className="text-sm font-semibold text-red-700 mb-1">Phase Errors</h4>
               {errors.map((err, i) => (
                 <p key={i} className="text-xs text-red-600">{err.phase}: {err.message}</p>
@@ -147,22 +211,20 @@ export function RunPage() {
             </div>
           )}
 
-          <OutputPanels outputs={agentOutputs} />
-        </div>
-      )}
+          <ActiveStepPanel step={activeStep} stream={streamBuffer} onOverride={sendOverride} />
 
-      {state === 'waiting' && humanRequest && (
-        <HumanInputModal
-          message={humanRequest.message}
-          requestedBy={humanRequest.requested_by}
-          inputType={humanRequest.input_type}
-          onSubmit={async (text, files) => {
-            if (!runId) return;
-            await api.runs.resume(runId, { response_text: text, uploaded_files: files });
-            setHumanRequest(null);
-            setState('running');
-          }}
-        />
+          <HistoryPanel steps={steps} />
+
+          <HumanInputPanel
+            request={humanRequest ? { message: humanRequest.message, input_type: humanRequest.input_type } : null}
+            onSubmit={(text) => {
+              if (!runId) return;
+              api.runs.resume(runId, { response_text: text, uploaded_files: [] });
+              setHumanRequest(null);
+              setState('running');
+            }}
+          />
+        </div>
       )}
 
       {state === 'done' && (

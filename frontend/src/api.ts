@@ -1,4 +1,4 @@
-import { Agent, Job, Run, RunContext, Settings } from './types';
+import { Agent, Job, Run, RunContext, Settings, RunStep } from './types';
 
 const BASE = (import.meta as any).env?.VITE_API_BASE_URL || '';
 
@@ -38,6 +38,8 @@ export const api = {
     resume: (id: number, response: { response_text: string; uploaded_files: string[] }) =>
       req<any>('POST', `/api/runs/${id}/resume`, response),
     stop: (id: number) => req<any>('POST', `/api/runs/${id}/stop`),
+    getSteps: (runId: number) => req<RunStep[]>('GET', `/api/runs/${runId}/steps`),
+    getChangelog: (runId: number) => req<{content: string}>('GET', `/api/runs/${runId}/changelog`),
   },
   ollama: {
     models: () => req<{name: string; size: number; digest: string; modified_at: string}[]>('GET', '/api/ollama/models'),

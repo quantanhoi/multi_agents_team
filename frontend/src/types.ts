@@ -17,6 +17,7 @@ export interface Job {
   planner_agent_id: number; coder_agent_id: number; tester_agent_id: number;
   agent_overrides: { planner?: AgentOverride; coder?: AgentOverride; tester?: AgentOverride };
   loop_mode: 'automatic' | 'manual'; max_iterations: number;
+  definition_of_done: string;
   created_at: string; updated_at: string;
 }
 
@@ -39,9 +40,19 @@ export interface HumanInputRequest {
   message: string; input_type: 'text' | 'file_upload' | 'screenshot_upload'; requested_by: string;
 }
 
+export interface RunStep {
+  step_number: number;
+  step_type: string;
+  agent: string;
+  output: any;
+  files_changed: string[];
+  created_at: string;
+}
+
 export interface WSMessage {
   type: 'phase_change' | 'agent_output' | 'human_input_required' | 'done' | 'failed' | 'error' | 'phase_error';
   phase?: string; message?: string; agent?: string; output?: any; error?: string;
+  role?: string; model?: string; step_number?: number;
   requested_by?: string; input_type?: string; status?: string; summary?: string;
   retryable?: boolean;
 }
