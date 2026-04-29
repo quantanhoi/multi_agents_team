@@ -41,7 +41,7 @@ export interface HumanInputRequest {
 
 export interface WSMessage {
   type: 'phase_change' | 'agent_output' | 'human_input_required' | 'done' | 'failed' | 'error' | 'phase_error';
-  phase?: string; message?: string; agent?: string; output?: any;
+  phase?: string; message?: string; agent?: string; output?: any; error?: string;
   requested_by?: string; input_type?: string; status?: string; summary?: string;
   retryable?: boolean;
 }

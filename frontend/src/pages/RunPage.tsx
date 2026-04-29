@@ -3,7 +3,7 @@ import { Run, RunStatus, WSMessage } from '../types';
 import { api } from '../api';
 import { ContextBuilder } from '../components/ContextBuilder';
 import { PhaseTimeline } from '../components/PhaseTimeline';
-import { OutputPanels } from '../components/OutputPanels';
+import { OutputPanels, AgentOutput } from '../components/OutputPanels';
 import { HumanInputModal } from '../components/HumanInputModal';
 
 type RunState = 'idle' | 'running' | 'waiting' | 'done';
@@ -13,9 +13,7 @@ export function RunPage() {
   const [runId, setRunId] = useState<number | null>(null);
   const [currentPhase, setCurrentPhase] = useState<RunStatus>('pending');
   const [completedPhases, setCompletedPhases] = useState<RunStatus[]>([]);
-  const [planOutput, setPlanOutput] = useState<any>(null);
-  const [coderOutputs, setCoderOutputs] = useState<any[]>([]);
-  const [testReports, setTestReports] = useState<any[]>([]);
+  const [agentOutputs, setAgentOutputs] = useState<AgentOutput[]>([]);
   const [errors, setErrors] = useState<{phase: string; message: string}[]>([]);
   const [humanRequest, setHumanRequest] = useState<{ message: string; requested_by: string; input_type: string } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -34,7 +32,11 @@ export function RunPage() {
 
   const connectWS = useCallback((targetRunId: number) => {
     clearReconnect();
-    const ws = new WebSocket(`ws://localhost:8002/ws/runs/${targetRunId}`);
+    const apiBase = (import.meta as any).env?.VITE_API_BASE_URL || '';
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsHost = apiBase ? new URL(apiBase).host : window.location.host;
+    const wsUrl = `${wsProto}//${wsHost}/ws/runs/${targetRunId}`;
+    const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -75,14 +77,14 @@ export function RunPage() {
         }
         break;
       case 'agent_output':
-        if (msg.agent === 'planner' && (msg.phase === 'planning_draft' || msg.phase === 'planning_finalize')) {
-          setPlanOutput(msg.output);
-        }
-        if (msg.agent === 'coder' && msg.phase === 'coding') {
-          setCoderOutputs(prev => [...prev, msg.output]);
-        }
-        if (msg.agent === 'tester' && msg.phase === 'testing') {
-          setTestReports(prev => [...prev, msg.output]);
+        if (msg.phase && msg.agent) {
+          setAgentOutputs(prev => [...prev, {
+            phase: msg.phase!,
+            agent: msg.agent!,
+            output: msg.output,
+            error: msg.error,
+            timestamp: Date.now(),
+          }]);
         }
         break;
       case 'phase_error':
@@ -114,9 +116,7 @@ export function RunPage() {
     phasesRef.current = { current: 'pending', completed: [] };
     setCompletedPhases([]);
     setCurrentPhase('pending');
-    setPlanOutput(null);
-    setCoderOutputs([]);
-    setTestReports([]);
+    setAgentOutputs([]);
     setErrors([]);
     setHumanRequest(null);
     setState('running');
@@ -147,7 +147,7 @@ export function RunPage() {
             </div>
           )}
 
-          <OutputPanels planOutput={planOutput} coderOutputs={coderOutputs} testReports={testReports} />
+          <OutputPanels outputs={agentOutputs} />
         </div>
       )}
 

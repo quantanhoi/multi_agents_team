@@ -6,7 +6,8 @@ import time
 from datetime import datetime, timezone
 from database import DB_PATH
 from websocket import ws_manager
-from ollama_client import call_ollama, OllamaError
+from claude_agent import ClaudeAgentRunner, ClaudeAgentError
+from worktree_manager import WorktreeManager
 import aiosqlite
 
 class Orchestrator:
@@ -16,9 +17,32 @@ class Orchestrator:
         self.overrides = json.loads(job_config.get("agent_overrides", "{}"))
         self.max_iterations = job_config.get("max_iterations", 5)
         self._phase_retry_count = {}
+        self._worktree_manager = None
+        self._agents = {}
 
     async def run(self, feature_request: str, context: dict):
         try:
+            # Verify Claude Code CLI is available
+            import shutil
+            if not shutil.which("claude"):
+                raise RuntimeError(
+                    "Claude Code CLI not found. Install it first: npm install -g @anthropic-ai/claude-code"
+                )
+
+            # Initialize worktrees for each agent
+            working_dir = await self._get_setting("working_dir") or "."
+            self._worktree_manager = WorktreeManager(working_dir, self.run_id)
+
+            # Create worktrees and agent runners
+            for role in ["planner", "coder", "tester"]:
+                wt_path = self._worktree_manager.create_worktree(role)
+                self._agents[role] = ClaudeAgentRunner(
+                    worktree_path=str(wt_path),
+                    role=role,
+                    allowed_tools=["Bash", "Read", "Edit", "Write", "Agent"],
+                    max_budget_usd=5.0,
+                )
+
             await self._update_status("planning_draft")
             roadmap = await self._planning_phase(feature_request, context)
 
@@ -42,7 +66,7 @@ class Orchestrator:
             await self._update_status("done")
             await self._broadcast({"type": "done", "status": "done", "summary": "All phases complete", "roadmap": result})
             return result
-        except OllamaError as e:
+        except ClaudeAgentError as e:
             await self._update_status("failed")
             await self._broadcast({"type": "failed", "status": "failed", "message": str(e)})
             raise
@@ -50,6 +74,10 @@ class Orchestrator:
             await self._update_status("failed")
             await self._broadcast({"type": "error", "phase": "unknown", "message": str(e), "retryable": False})
             raise
+        finally:
+            # Cleanup worktrees
+            if self._worktree_manager:
+                self._worktree_manager.cleanup_all()
 
     async def _planning_phase(self, feature_request: str, context: dict, human_response: str = ""):
         planner = await self._get_agent("planner")
@@ -58,14 +86,21 @@ class Orchestrator:
 
         human_context = f"\n\nHuman response from previous request: {human_response}" if human_response else ""
 
-        draft, draft_error = await self._call_agent_with_retry(
-            planner, {
-                "role": "system", "content": planner["system_prompt"]
-            }, {
-                "role": "user",
-                "content": f"Feature request:\n{feature_request}\n\nContext files:\n{files_content}\n\nKnown bugs: {context.get('known_bugs', [])}\nConstraints: {context.get('constraints', [])}\nExtra notes: {context.get('extra_notes', '')}{human_context}\n\nProduce a phased roadmap with definition_of_done per phase."
-            },
-            phase="planning_draft"
+        system_prompt = planner["system_prompt"]
+        user_prompt = f"""Feature request:
+{feature_request}
+
+Context files:
+{files_content}
+
+Known bugs: {context.get('known_bugs', [])}
+Constraints: {context.get('constraints', [])}
+Extra notes: {context.get('extra_notes', '')}{human_context}
+
+Produce a phased roadmap with definition_of_done per phase. Return JSON with: goal, tasks, files_needed, risks, acceptance_criteria, test_plan, roadmap (list of phases)."""
+
+        draft, draft_error = await self._call_claude_agent_with_retry(
+            "planner", system_prompt, user_prompt, phase="planning_draft"
         )
         await self._broadcast({"type": "agent_output", "phase": "planning_draft", "agent": "planner", "output": draft, "error": draft_error})
 
@@ -73,47 +108,50 @@ class Orchestrator:
             return draft if draft else {"error": draft_error}
 
         await self._update_status("planning_review_coder")
-        coder = await self._get_agent("coder")
-        coder_review, coder_error = await self._call_agent_with_retry(
-            coder, {
-                "role": "system",
-                "content": "You are reviewing a development plan as the coder. Identify technical issues, infeasible tasks, or better approaches. Return JSON: {verdict, concerns, technical_suggestions, human_input_request}"
-            }, {
-                "role": "user",
-                "content": f"Review this plan:\n{json.dumps(draft, indent=2)}"
-            },
+        await self._update_status("planning_review_tester")
+
+        # Run coder and tester reviews IN PARALLEL
+        coder_review_task = self._call_claude_agent_with_retry(
+            "coder",
+            "You are reviewing a development plan as the coder. Identify technical issues, infeasible tasks, or better approaches. Return JSON: {verdict, concerns, technical_suggestions, human_input_request}",
+            f"Review this plan:\n{json.dumps(draft, indent=2)}",
             phase="planning_review_coder"
         )
-        await self._broadcast({"type": "agent_output", "phase": "planning_review_coder", "agent": "coder", "output": coder_review, "error": coder_error})
-
-        await self._update_status("planning_review_tester")
-        tester = await self._get_agent("tester")
-        tester_review, tester_error = await self._call_agent_with_retry(
-            tester, {
-                "role": "system",
-                "content": "You are reviewing a development plan as the tester. Identify missing edge cases, test gaps, or automation concerns. Return JSON: {verdict, missing_test_scenarios, test_approach_suggestions, human_input_request}"
-            }, {
-                "role": "user",
-                "content": f"Review this plan:\n{json.dumps(draft, indent=2)}"
-            },
+        tester_review_task = self._call_claude_agent_with_retry(
+            "tester",
+            "You are reviewing a development plan as the tester. Identify missing edge cases, test gaps, or automation concerns. Return JSON: {verdict, missing_test_scenarios, test_approach_suggestions, human_input_request}",
+            f"Review this plan:\n{json.dumps(draft, indent=2)}",
             phase="planning_review_tester"
         )
+
+        (coder_review, coder_error), (tester_review, tester_error) = await asyncio.gather(
+            coder_review_task, tester_review_task
+        )
+
+        await self._broadcast({"type": "agent_output", "phase": "planning_review_coder", "agent": "coder", "output": coder_review, "error": coder_error})
         await self._broadcast({"type": "agent_output", "phase": "planning_review_tester", "agent": "tester", "output": tester_review, "error": tester_error})
 
         await self._update_status("planning_finalize")
         feedback = f"Coder concerns: {json.dumps(coder_review.get('concerns', []) if coder_review else [])}\nCoder suggestions: {json.dumps(coder_review.get('technical_suggestions', []) if coder_review else [])}\nTester missing scenarios: {json.dumps(tester_review.get('missing_test_scenarios', []) if tester_review else [])}\nTester suggestions: {json.dumps(tester_review.get('test_approach_suggestions', []) if tester_review else [])}"
 
-        final_plan, final_error = await self._call_agent_with_retry(
-            planner, {
-                "role": "system", "content": planner["system_prompt"]
-            }, {
-                "role": "user",
-                "content": f"Your original plan:\n{json.dumps(draft, indent=2)}\n\nReview feedback:\n{feedback}\n\nIncorporate the feedback and return the finalized roadmap."
-            },
+        final_plan, final_error = await self._call_claude_agent_with_retry(
+            "planner",
+            system_prompt,
+            f"Your original plan:\n{json.dumps(draft, indent=2)}\n\nReview feedback:\n{feedback}\n\nIncorporate the feedback and return the finalized roadmap.",
             phase="planning_finalize"
         )
         await self._broadcast({"type": "agent_output", "phase": "planning_finalize", "agent": "planner", "output": final_plan, "error": final_error})
         await self._save_roadmap(final_plan)
+
+        # Commit planner output to worktree
+        if self._worktree_manager:
+            try:
+                plan_json = json.dumps(final_plan, indent=2)
+                self._worktree_manager.write_file("planner", "plan.json", plan_json)
+                self._worktree_manager.commit("planner", f"run-{self.run_id}: finalize plan")
+            except Exception:
+                pass
+
         return final_plan
 
     async def _execution_loop(self, roadmap):
@@ -126,19 +164,23 @@ class Orchestrator:
             await self._update_status("coding")
 
             coder = await self._get_agent("coder")
-            coder_output, coder_error = await self._call_agent_with_retry(
-                coder, {
-                    "role": "system", "content": coder["system_prompt"]
-                }, {
-                    "role": "user",
-                    "content": f"Implement this phase:\n{json.dumps(current, indent=2)}\n\nDefinition of Done for coder: {current.get('definition_of_done', {}).get('for_coder', '')}"
-                },
-                phase="coding"
+            coder_system = coder["system_prompt"]
+            coder_user = f"Implement this phase:\n{json.dumps(current, indent=2)}\n\nDefinition of Done for coder: {current.get('definition_of_done', {}).get('for_coder', '')}"
+
+            coder_output, coder_error = await self._call_claude_agent_with_retry(
+                "coder", coder_system, coder_user, phase="coding"
             )
             await self._broadcast({"type": "agent_output", "phase": "coding", "agent": "coder", "output": coder_output, "error": coder_error})
+
             if coder_output:
                 await self._append_output("coder_outputs", coder_output)
                 await self._write_files(coder_output)
+                # Commit coder changes
+                if self._worktree_manager:
+                    try:
+                        self._worktree_manager.commit("coder", f"run-{self.run_id}: phase {phase_idx + 1} coding")
+                    except Exception:
+                        pass
 
             if self._needs_human(coder_output):
                 coder_output = await self._wait_for_human(coder_output)
@@ -150,18 +192,23 @@ class Orchestrator:
             test_result = self._run_command("pytest -q" if working_dir else "echo 'no tests configured'")
 
             tester = await self._get_agent("tester")
-            tester_output, tester_error = await self._call_agent_with_retry(
-                tester, {
-                    "role": "system", "content": tester["system_prompt"]
-                }, {
-                    "role": "user",
-                    "content": f"Phase:\n{json.dumps(current, indent=2)}\n\nCoder output:\n{json.dumps(coder_output, indent=2)}\n\nLint:\n{json.dumps(lint_result)}\n\nTests:\n{json.dumps(test_result)}\n\nDoD for coder: {current.get('definition_of_done', {}).get('for_coder', '')}\nDoD for tester: {current.get('definition_of_done', {}).get('for_tester', '')}"
-                },
-                phase="testing"
+            tester_system = tester["system_prompt"]
+            tester_user = f"Phase:\n{json.dumps(current, indent=2)}\n\nCoder output:\n{json.dumps(coder_output, indent=2)}\n\nLint:\n{json.dumps(lint_result)}\n\nTests:\n{json.dumps(test_result)}\n\nDoD for coder: {current.get('definition_of_done', {}).get('for_coder', '')}\nDoD for tester: {current.get('definition_of_done', {}).get('for_tester', '')}"
+
+            tester_output, tester_error = await self._call_claude_agent_with_retry(
+                "tester", tester_system, tester_user, phase="testing"
             )
             await self._broadcast({"type": "agent_output", "phase": "testing", "agent": "tester", "output": tester_output, "error": tester_error})
+
             if tester_output:
                 await self._append_output("test_reports", tester_output)
+                # Commit tester report
+                if self._worktree_manager:
+                    try:
+                        self._worktree_manager.write_file("tester", f"test_report_phase_{phase_idx}.json", json.dumps(tester_output, indent=2))
+                        self._worktree_manager.commit("tester", f"run-{self.run_id}: phase {phase_idx + 1} testing")
+                    except Exception:
+                        pass
 
             if self._needs_human(tester_output):
                 tester_output = await self._wait_for_human(tester_output)
@@ -169,15 +216,11 @@ class Orchestrator:
 
             await self._update_status("evaluating")
             planner = await self._get_agent("planner")
-            decision, decision_error = await self._call_agent_with_retry(
-                planner, {
-                    "role": "system",
-                    "content": "You are re-evaluating the plan after an execution iteration. Return JSON: {action: 'continue'|'adjust'|'done', reasoning, revised_roadmap, next_tasks_for_coder, human_input_request}"
-                }, {
-                    "role": "user",
-                    "content": f"Roadmap:\n{json.dumps(roadmap, indent=2)}\n\nCurrent phase ({phase_idx + 1}/{len(phases)}):\n{json.dumps(current, indent=2)}\n\nCoder output:\n{json.dumps(coder_output, indent=2)}\n\nTest report:\n{json.dumps(tester_output, indent=2)}"
-                },
-                phase="evaluating"
+            planner_system = "You are re-evaluating the plan after an execution iteration. Return JSON: {action: 'continue'|'adjust'|'done', reasoning, revised_roadmap, next_tasks_for_coder, human_input_request}"
+            planner_user = f"Roadmap:\n{json.dumps(roadmap, indent=2)}\n\nCurrent phase ({phase_idx + 1}/{len(phases)}):\n{json.dumps(current, indent=2)}\n\nCoder output:\n{json.dumps(coder_output, indent=2)}\n\nTest report:\n{json.dumps(tester_output, indent=2)}"
+
+            decision, decision_error = await self._call_claude_agent_with_retry(
+                "planner", planner_system, planner_user, phase="evaluating"
             )
             await self._broadcast({"type": "agent_output", "phase": "evaluating", "agent": "planner", "output": decision, "error": decision_error})
 
@@ -198,19 +241,35 @@ class Orchestrator:
 
         return {"roadmap": roadmap, "completed": phase_idx >= len(phases)}
 
-    async def _call_agent_with_retry(self, agent_config: dict, system_msg: dict, user_msg: dict, phase: str, max_retries: int = 1) -> tuple:
-        """Call an agent with per-phase retry logic. Returns (output, error)."""
+    async def _call_claude_agent_with_retry(self, role: str, system_prompt: str, user_prompt: str, phase: str, max_retries: int = 1) -> tuple:
+        """Call a Claude Code agent with per-phase retry logic. Returns (output, error)."""
         for attempt in range(max_retries + 1):
             start = time.time()
             try:
-                result = await self._call_agent(agent_config, system_msg, user_msg)
+                agent = self._agents.get(role)
+                if not agent:
+                    raise ClaudeAgentError(f"No agent configured for role: {role}")
+
+                result = agent.run(user_prompt, system_prompt=system_prompt)
                 latency_ms = int((time.time() - start) * 1000)
-                await self._save_step(phase, agent_config.get("_role", "unknown"), json.dumps({"system": system_msg, "user": user_msg}), json.dumps(result), latency_ms, None)
-                return result, None
-            except OllamaError as e:
+
+                # Parse structured output from Claude Code
+                output = result.get("output")
+                if isinstance(output, str):
+                    try:
+                        output = json.loads(output)
+                    except json.JSONDecodeError:
+                        # If not valid JSON, wrap in a dict
+                        output = {"raw_output": output, "files_changed": result.get("files_changed", [])}
+                elif output is None:
+                    output = {"raw_output": result.get("raw_output", ""), "files_changed": result.get("files_changed", [])}
+
+                await self._save_step(phase, role, json.dumps({"system": system_prompt, "user": user_prompt}), json.dumps(output), latency_ms, None)
+                return output, None
+            except ClaudeAgentError as e:
                 latency_ms = int((time.time() - start) * 1000)
                 error_msg = str(e)
-                await self._save_step(phase, agent_config.get("_role", "unknown"), json.dumps({"system": system_msg, "user": user_msg}), None, latency_ms, error_msg)
+                await self._save_step(phase, role, json.dumps({"system": system_prompt, "user": user_prompt}), None, latency_ms, error_msg)
                 if attempt == max_retries:
                     await self._broadcast({"type": "phase_error", "phase": phase, "message": error_msg, "retryable": True})
                     return None, error_msg
@@ -218,30 +277,10 @@ class Orchestrator:
             except Exception as e:
                 latency_ms = int((time.time() - start) * 1000)
                 error_msg = str(e)
-                await self._save_step(phase, agent_config.get("_role", "unknown"), json.dumps({"system": system_msg, "user": user_msg}), None, latency_ms, error_msg)
+                await self._save_step(phase, role, json.dumps({"system": system_prompt, "user": user_prompt}), None, latency_ms, error_msg)
                 await self._broadcast({"type": "phase_error", "phase": phase, "message": error_msg, "retryable": False})
                 return None, error_msg
         return None, "Unexpected: all retries exhausted"
-
-    async def _call_agent(self, agent_config: dict, system_msg: dict, user_msg: dict) -> dict:
-        endpoint = agent_config.get("ollama_endpoint", "http://localhost:11434")
-        model = agent_config.get("model_name")
-        temp = agent_config.get("temperature", 0.3)
-        api_key = agent_config.get("api_key", "")
-
-        override = self.overrides.get(agent_config.get("_role", ""), {})
-        if override.get("temperature") is not None:
-            temp = override["temperature"]
-
-        system_content = agent_config["system_prompt"]
-        if override.get("system_prompt_append"):
-            system_content += "\n\n" + override["system_prompt_append"]
-
-        messages = [
-            {"role": "system", "content": system_content},
-            user_msg
-        ]
-        return await call_ollama(endpoint, model, messages, temp, api_key)
 
     async def _get_agent(self, role: str) -> dict:
         db = await aiosqlite.connect(DB_PATH)

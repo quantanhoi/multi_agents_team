@@ -1,34 +1,69 @@
-export function OutputPanels({ planOutput, coderOutputs, testReports }: {
-  planOutput: any; coderOutputs: any[]; testReports: any[];
-}) {
-  return (
-    <div className="grid grid-cols-3 gap-4 mt-4">
-      <div className="border rounded-lg p-3 max-h-96 overflow-y-auto">
-        <h4 className="font-semibold text-sm mb-2 text-blue-700">PLAN</h4>
-        <pre className="text-xs whitespace-pre-wrap">{planOutput ? JSON.stringify(planOutput, null, 2) : 'Waiting...'}</pre>
-      </div>
-      <div className="border rounded-lg p-3 max-h-96 overflow-y-auto">
-        <h4 className="font-semibold text-sm mb-2 text-green-700">CODER OUTPUT</h4>
-        {coderOutputs.length === 0 ? <p className="text-xs text-gray-400">Waiting...</p> : (
-          coderOutputs.map((o, i) => (
-            <div key={i} className="mb-2 border-b pb-2 text-xs">
-              <p className="font-medium">{o.summary || 'Iteration ' + (i + 1)}</p>
-              <pre className="text-xs whitespace-pre-wrap mt-1 bg-gray-50 p-2 rounded">{JSON.stringify(o, null, 2)}</pre>
-            </div>
-          ))
+export type AgentOutput = {
+  phase: string;
+  agent: string;
+  output: any;
+  error?: string;
+  timestamp?: number;
+};
+
+export function OutputPanels({ outputs }: { outputs: AgentOutput[] }) {
+  // Group outputs by agent
+  const plannerOutputs = outputs.filter(o => o.agent === 'planner');
+  const coderOutputs = outputs.filter(o => o.agent === 'coder');
+  const testerOutputs = outputs.filter(o => o.agent === 'tester');
+
+  const renderOutputCard = (output: AgentOutput, index: number) => {
+    const hasError = !!output.error;
+    return (
+      <div key={`${output.phase}-${index}`} className={`mb-3 p-3 rounded-lg border ${hasError ? 'border-red-200 bg-red-50' : 'border-gray-200 bg-white'}`}>
+        <div className="flex items-center justify-between mb-2">
+          <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">{output.phase}</span>
+          {hasError && <span className="text-xs font-bold text-red-600">ERROR</span>}
+        </div>
+        {output.error ? (
+          <p className="text-xs text-red-600">{output.error}</p>
+        ) : (
+          <pre className="text-xs whitespace-pre-wrap bg-gray-50 p-2 rounded">{output.output ? JSON.stringify(output.output, null, 2) : 'No output'}</pre>
         )}
       </div>
-      <div className="border rounded-lg p-3 max-h-96 overflow-y-auto">
-        <h4 className="font-semibold text-sm mb-2 text-orange-700">TEST REPORT</h4>
-        {testReports.length === 0 ? <p className="text-xs text-gray-400">Waiting...</p> : (
-          testReports.map((r, i) => (
-            <div key={i} className="mb-2 border-b pb-2 text-xs">
-              <span className={`px-1.5 py-0.5 rounded text-xs font-bold ${r.status === 'pass' ? 'bg-green-200 text-green-800' : 'bg-red-200 text-red-800'}`}>
-                {r.status?.toUpperCase()}
-              </span>
-              <pre className="text-xs whitespace-pre-wrap mt-1 bg-gray-50 p-2 rounded">{JSON.stringify(r, null, 2)}</pre>
-            </div>
-          ))
+    );
+  };
+
+  return (
+    <div className="grid grid-cols-3 gap-4 mt-4">
+      <div className="border rounded-lg p-3 max-h-[500px] overflow-y-auto">
+        <h4 className="font-semibold text-sm mb-3 text-blue-700 flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-blue-500"></span>
+          PLANNER
+        </h4>
+        {plannerOutputs.length === 0 ? (
+          <p className="text-xs text-gray-400 italic">Waiting for planner...</p>
+        ) : (
+          plannerOutputs.map((o, i) => renderOutputCard(o, i))
+        )}
+      </div>
+
+      <div className="border rounded-lg p-3 max-h-[500px] overflow-y-auto">
+        <h4 className="font-semibold text-sm mb-3 text-green-700 flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-green-500"></span>
+          CODER
+        </h4>
+        {coderOutputs.length === 0 ? (
+          <p className="text-xs text-gray-400 italic">Waiting for coder...</p>
+        ) : (
+          coderOutputs.map((o, i) => renderOutputCard(o, i))
+        )}
+      </div>
+
+      <div className="border rounded-lg p-3 max-h-[500px] overflow-y-auto">
+        <h4 className="font-semibold text-sm mb-3 text-orange-700 flex items-center gap-2">
+          <span className="w-2 h-2 rounded-full bg-orange-500"></span>
+          TESTER
+        </h4>
+        {testerOutputs.length === 0 ? (
+          <p className="text-xs text-gray-400 italic">Waiting for tester...</p>
+        ) : (
+          testerOutputs.map((o, i) => renderOutputCard(o, i))
         )}
       </div>
     </div>
