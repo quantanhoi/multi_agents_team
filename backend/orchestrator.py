@@ -8,7 +8,10 @@ from database import DB_PATH
 from websocket import ws_manager
 from opencode_agent import OpenCodeAgentRunner, OpenCodeAgentError
 from worktree_manager import WorktreeManager
+from role_resolver import RoleResolver
+from session_logger import SessionLogger
 import aiosqlite
+
 
 class Orchestrator:
     def __init__(self, run_id: int, job_config: dict):
@@ -16,56 +19,102 @@ class Orchestrator:
         self.job = job_config
         self.overrides = json.loads(job_config.get("agent_overrides", "{}"))
         self.max_iterations = job_config.get("max_iterations", 5)
-        self._phase_retry_count = {}
+        self.definition_of_done = job_config.get("definition_of_done", "")
         self._worktree_manager = None
-        self._agents = {}
+        self._role_resolver = None
+        self._session_logger = None
+        self._step_number = 0
+        self._git_runner = None
+        self._base_commit = None
 
     async def run(self, feature_request: str, context: dict):
         try:
-            # Verify Claude Code CLI is available
             import shutil
             if not shutil.which("opencode"):
                 raise RuntimeError(
                     "OpenCode CLI not found. Install it first: npm install -g opencode"
                 )
 
-            # Initialize worktrees for each agent
             working_dir = await self._get_setting("working_dir") or "."
             self._worktree_manager = WorktreeManager(working_dir, self.run_id)
 
-            # Create single shared worktree and agent runners
+            # Create single shared worktree
             wt_path = self._worktree_manager.create()
-            for role in ["planner", "coder", "tester"]:
-                self._agents[role] = OpenCodeAgentRunner(
-                    worktree_path=str(wt_path),
-                    role=role,
-                    allowed_tools=["Bash", "Read", "Edit", "Write", "Agent"],
-                    max_budget_usd=5.0,
-                )
 
-            await self._update_status("planning_draft")
-            roadmap = await self._planning_phase(feature_request, context)
+            # Resolve base commit for diffing
+            ref_result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=str(wt_path),
+                capture_output=True,
+                text=True,
+            )
+            self._base_commit = ref_result.stdout.strip() if ref_result.returncode == 0 else "HEAD"
 
-            if self._needs_human(roadmap):
-                roadmap = await self._wait_for_human(roadmap)
-                human_response = roadmap.get("_human_response", "")
-                await self._update_status("planning_draft")
-                roadmap = await self._planning_phase(feature_request, context, human_response)
+            # Load agents for this job
+            agents = await self._load_agents()
+            self._role_resolver = RoleResolver(self.job, agents)
 
-            if not self._needs_human(roadmap):
-                await self._update_status("planning_finalize")
-                exec_result = await self._execution_loop(roadmap)
-                if not exec_result["completed"]:
-                    await self._update_status("failed")
-                    await self._broadcast({"type": "failed", "status": "failed", "message": "Max iterations reached without completing all phases"})
-                    return exec_result["roadmap"]
-                result = exec_result["roadmap"]
+            # Initialize session logger
+            self._session_logger = SessionLogger(
+                worktree_path=str(wt_path),
+                db_path=DB_PATH,
+                run_id=self.run_id,
+            )
+
+            # Single git runner for diff queries across all roles
+            self._git_runner = OpenCodeAgentRunner(
+                worktree_path=str(wt_path),
+                role="orchestrator",
+            )
+
+            task = feature_request
+            iteration = 0
+            done = False
+            result = None
+
+            while not done and iteration < self.max_iterations:
+                plan = await self._execute_role("planner", task, context, "plan")
+                if self._needs_human(plan):
+                    plan = await self._wait_for_human(plan)
+
+                code = await self._execute_role("coder", json.dumps(plan), context, "code")
+                if self._needs_human(code):
+                    code = await self._wait_for_human(code)
+
+                test = await self._execute_role("tester", json.dumps(code), context, "test")
+                if self._needs_human(test):
+                    test = await self._wait_for_human(test)
+
+                eval_input = json.dumps({"plan": plan, "code": code, "test": test})
+                eval_result = await self._execute_role("planner", eval_input, context, "evaluate")
+                if self._needs_human(eval_result):
+                    eval_result = await self._wait_for_human(eval_result)
+
+                done = (eval_result.get("action") == "done")
+                task = eval_result.get("next_task", task)
+                result = eval_result
+
+                iteration += 1
+                await self._update_iterations(iteration)
+
+            if done:
+                await self._update_status("done")
+                await self._broadcast({
+                    "type": "done",
+                    "status": "done",
+                    "summary": "All phases complete",
+                    "roadmap": result,
+                })
+                return result
             else:
-                result = roadmap
+                await self._update_status("failed")
+                await self._broadcast({
+                    "type": "failed",
+                    "status": "failed",
+                    "message": "Max iterations reached without completing all phases",
+                })
+                return result
 
-            await self._update_status("done")
-            await self._broadcast({"type": "done", "status": "done", "summary": "All phases complete", "roadmap": result})
-            return result
         except OpenCodeAgentError as e:
             await self._update_status("failed")
             await self._broadcast({"type": "failed", "status": "failed", "message": str(e)})
@@ -79,225 +128,158 @@ class Orchestrator:
             if self._worktree_manager:
                 self._worktree_manager.remove()
 
-    async def _planning_phase(self, feature_request: str, context: dict, human_response: str = ""):
-        planner = await self._get_agent("planner")
-        working_dir = await self._get_setting("working_dir")
-        files_content = self._read_context_files(context.get("selected_files", []), working_dir)
+    async def _execute_role(self, role: str, task: str, context: dict, step_type: str) -> dict:
+        """Execute a single role step in the sequential pipeline."""
+        start = time.time()
+        self._step_number += 1
+        step_number = self._step_number
 
-        human_context = f"\n\nHuman response from previous request: {human_response}" if human_response else ""
+        # 1. Resolve agent
+        agent = self._role_resolver.assign(role)
 
-        system_prompt = planner["system_prompt"]
-        user_prompt = f"""Feature request:
-{feature_request}
+        # 2. Build system prompt
+        system_prompt = self._build_system_prompt(agent)
 
-Context files:
-{files_content}
-
-Known bugs: {context.get('known_bugs', [])}
-Constraints: {context.get('constraints', [])}
-Extra notes: {context.get('extra_notes', '')}{human_context}
-
-Produce a phased roadmap with definition_of_done per phase. Return JSON with: goal, tasks, files_needed, risks, acceptance_criteria, test_plan, roadmap (list of phases)."""
-
-        draft, draft_error = await self._call_claude_agent_with_retry(
-            "planner", system_prompt, user_prompt, phase="planning_draft"
-        )
-        await self._broadcast({"type": "agent_output", "phase": "planning_draft", "agent": "planner", "output": draft, "error": draft_error})
-
-        if draft_error or self._needs_human(draft):
-            return draft if draft else {"error": draft_error}
-
-        await self._update_status("planning_review_coder")
-        await self._update_status("planning_review_tester")
-
-        # Run coder and tester reviews IN PARALLEL
-        coder_review_task = self._call_claude_agent_with_retry(
-            "coder",
-            "You are reviewing a development plan as the coder. Identify technical issues, infeasible tasks, or better approaches. Return JSON: {verdict, concerns, technical_suggestions, human_input_request}",
-            f"Review this plan:\n{json.dumps(draft, indent=2)}",
-            phase="planning_review_coder"
-        )
-        tester_review_task = self._call_claude_agent_with_retry(
-            "tester",
-            "You are reviewing a development plan as the tester. Identify missing edge cases, test gaps, or automation concerns. Return JSON: {verdict, missing_test_scenarios, test_approach_suggestions, human_input_request}",
-            f"Review this plan:\n{json.dumps(draft, indent=2)}",
-            phase="planning_review_tester"
+        # 3. Run OpenCodeAgentRunner per step
+        runner = OpenCodeAgentRunner(
+            worktree_path=str(self._worktree_manager.worktree_path),
+            role=role,
+            model=agent.get("model_name"),
         )
 
-        (coder_review, coder_error), (tester_review, tester_error) = await asyncio.gather(
-            coder_review_task, tester_review_task
-        )
+        phase_name = f"{step_type}_{role}"
+        await self._update_status(phase_name)
 
-        await self._broadcast({"type": "agent_output", "phase": "planning_review_coder", "agent": "coder", "output": coder_review, "error": coder_error})
-        await self._broadcast({"type": "agent_output", "phase": "planning_review_tester", "agent": "tester", "output": tester_review, "error": tester_error})
+        try:
+            result = runner.run(task, system_prompt=system_prompt)
+        except OpenCodeAgentError as e:
+            latency_ms = int((time.time() - start) * 1000)
+            error_msg = str(e)
+            await self._session_logger.log_step(
+                step_number=step_number,
+                role=role,
+                step_type=step_type,
+                input_data=task,
+                output_data=None,
+                latency_ms=latency_ms,
+                error=error_msg,
+                files_changed=None,
+                git_commit=None,
+            )
+            await self._broadcast({
+                "type": "phase_error",
+                "phase": phase_name,
+                "message": error_msg,
+                "retryable": True,
+            })
+            raise
 
-        await self._update_status("planning_finalize")
-        feedback = f"Coder concerns: {json.dumps(coder_review.get('concerns', []) if coder_review else [])}\nCoder suggestions: {json.dumps(coder_review.get('technical_suggestions', []) if coder_review else [])}\nTester missing scenarios: {json.dumps(tester_review.get('missing_test_scenarios', []) if tester_review else [])}\nTester suggestions: {json.dumps(tester_review.get('test_approach_suggestions', []) if tester_review else [])}"
+        latency_ms = int((time.time() - start) * 1000)
 
-        final_plan, final_error = await self._call_claude_agent_with_retry(
-            "planner",
-            system_prompt,
-            f"Your original plan:\n{json.dumps(draft, indent=2)}\n\nReview feedback:\n{feedback}\n\nIncorporate the feedback and return the finalized roadmap.",
-            phase="planning_finalize"
-        )
-        await self._broadcast({"type": "agent_output", "phase": "planning_finalize", "agent": "planner", "output": final_plan, "error": final_error})
-        await self._save_roadmap(final_plan)
-
-        # Commit planner output to worktree
-        if self._worktree_manager:
+        # Parse structured output
+        output = result.get("output")
+        if isinstance(output, str):
             try:
-                plan_json = json.dumps(final_plan, indent=2)
-                self._worktree_manager.write_file("plan.json", plan_json)
-                self._worktree_manager.commit(f"run-{self.run_id}: finalize plan")
+                output = json.loads(output)
+            except json.JSONDecodeError:
+                output = {"raw_output": output, "files_changed": result.get("files_changed", [])}
+        elif output is None:
+            output = {"raw_output": result.get("raw_output", ""), "files_changed": result.get("files_changed", [])}
+
+        # 5. Commit changes if files changed
+        files_changed = result.get("files_changed", [])
+        git_commit = None
+        if files_changed:
+            try:
+                committed = self._worktree_manager.commit(
+                    f"run-{self.run_id}: {role} {step_type}",
+                    files=files_changed,
+                )
+                if committed:
+                    commit_result = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=str(self._worktree_manager.worktree_path),
+                        capture_output=True,
+                        text=True,
+                    )
+                    git_commit = commit_result.stdout.strip() if commit_result.returncode == 0 else None
             except Exception:
                 pass
 
-        return final_plan
+        # 4. Log step via SessionLogger
+        await self._session_logger.log_step(
+            step_number=step_number,
+            role=role,
+            step_type=step_type,
+            input_data=task,
+            output_data=json.dumps(output),
+            latency_ms=latency_ms,
+            error=None,
+            files_changed=files_changed,
+            git_commit=git_commit,
+        )
 
-    async def _execution_loop(self, roadmap):
-        phases = roadmap.get("roadmap", [])
-        phase_idx = 0
-        iteration = 0
+        # 6. Broadcast WebSocket events
+        await self._broadcast({
+            "type": "agent_output",
+            "phase": phase_name,
+            "agent": role,
+            "output": output,
+            "error": None,
+        })
 
-        while iteration < self.max_iterations and phase_idx < len(phases):
-            current = phases[phase_idx]
-            await self._update_status("coding")
+        # 7. Handle human escalation
+        if self._needs_human(output):
+            output = await self._wait_for_human(output)
 
-            coder = await self._get_agent("coder")
-            coder_system = coder["system_prompt"]
-            coder_user = f"Implement this phase:\n{json.dumps(current, indent=2)}\n\nDefinition of Done for coder: {current.get('definition_of_done', {}).get('for_coder', '')}"
+        return output
 
-            coder_output, coder_error = await self._call_claude_agent_with_retry(
-                "coder", coder_system, coder_user, phase="coding"
-            )
-            await self._broadcast({"type": "agent_output", "phase": "coding", "agent": "coder", "output": coder_output, "error": coder_error})
+    def _build_system_prompt(self, agent: dict) -> str:
+        """Assemble system prompt from base prompt, DoD, CHANGELOG, and git diff."""
+        parts = []
+        base = agent.get("system_prompt", "")
+        if base:
+            parts.append(base)
 
-            if coder_output:
-                await self._append_output("coder_outputs", coder_output)
-                await self._write_files(coder_output)
-                # Commit coder changes
-                if self._worktree_manager:
-                    try:
-                        self._worktree_manager.commit(f"run-{self.run_id}: phase {phase_idx + 1} coding")
-                    except Exception:
-                        pass
+        if self.definition_of_done:
+            parts.append(f"Definition of Done:\n{self.definition_of_done}")
 
-            if self._needs_human(coder_output):
-                coder_output = await self._wait_for_human(coder_output)
-                await self._append_output("coder_outputs", coder_output)
+        try:
+            changelog = self._worktree_manager.read_file("CHANGELOG.md")
+            if changelog and not changelog.startswith("File "):
+                parts.append(f"Changelog:\n{changelog}")
+        except Exception:
+            pass
 
-            await self._update_status("testing")
-            working_dir = await self._get_setting("working_dir")
-            lint_result = self._run_command("ruff check ." if working_dir else "echo 'no lint configured'")
-            test_result = self._run_command("pytest -q" if working_dir else "echo 'no tests configured'")
+        try:
+            if self._git_runner and self._base_commit:
+                diff = self._git_runner.get_git_diff(self._base_commit)
+                if diff:
+                    parts.append(f"Git Diff:\n{diff}")
+        except Exception:
+            pass
 
-            tester = await self._get_agent("tester")
-            tester_system = tester["system_prompt"]
-            tester_user = f"Phase:\n{json.dumps(current, indent=2)}\n\nCoder output:\n{json.dumps(coder_output, indent=2)}\n\nLint:\n{json.dumps(lint_result)}\n\nTests:\n{json.dumps(test_result)}\n\nDoD for coder: {current.get('definition_of_done', {}).get('for_coder', '')}\nDoD for tester: {current.get('definition_of_done', {}).get('for_tester', '')}"
+        return "\n\n".join(parts)
 
-            tester_output, tester_error = await self._call_claude_agent_with_retry(
-                "tester", tester_system, tester_user, phase="testing"
-            )
-            await self._broadcast({"type": "agent_output", "phase": "testing", "agent": "tester", "output": tester_output, "error": tester_error})
-
-            if tester_output:
-                await self._append_output("test_reports", tester_output)
-                # Commit tester report
-                if self._worktree_manager:
-                    try:
-                        self._worktree_manager.write_file(f"test_report_phase_{phase_idx}.json", json.dumps(tester_output, indent=2))
-                        self._worktree_manager.commit(f"run-{self.run_id}: phase {phase_idx + 1} testing")
-                    except Exception:
-                        pass
-
-            if self._needs_human(tester_output):
-                tester_output = await self._wait_for_human(tester_output)
-                await self._append_output("test_reports", tester_output)
-
-            await self._update_status("evaluating")
-            planner = await self._get_agent("planner")
-            planner_system = "You are re-evaluating the plan after an execution iteration. Return JSON: {action: 'continue'|'adjust'|'done', reasoning, revised_roadmap, next_tasks_for_coder, human_input_request}"
-            planner_user = f"Roadmap:\n{json.dumps(roadmap, indent=2)}\n\nCurrent phase ({phase_idx + 1}/{len(phases)}):\n{json.dumps(current, indent=2)}\n\nCoder output:\n{json.dumps(coder_output, indent=2)}\n\nTest report:\n{json.dumps(tester_output, indent=2)}"
-
-            decision, decision_error = await self._call_claude_agent_with_retry(
-                "planner", planner_system, planner_user, phase="evaluating"
-            )
-            await self._broadcast({"type": "agent_output", "phase": "evaluating", "agent": "planner", "output": decision, "error": decision_error})
-
-            if decision_error or not decision:
-                await self._broadcast({"type": "phase_error", "phase": "evaluating", "message": decision_error or "Planner returned empty decision", "retryable": True})
-                continue
-
-            if decision.get("action") == "done":
-                break
-            elif decision.get("action") == "adjust" and decision.get("revised_roadmap"):
-                roadmap = decision["revised_roadmap"]
-                phases = roadmap.get("roadmap", [])
-            elif decision.get("action") == "continue":
-                phase_idx += 1
-
-            iteration += 1
-            await self._update_iterations(iteration)
-
-        return {"roadmap": roadmap, "completed": phase_idx >= len(phases)}
-
-    async def _call_claude_agent_with_retry(self, role: str, system_prompt: str, user_prompt: str, phase: str, max_retries: int = 1) -> tuple:
-        """Call a Claude Code agent with per-phase retry logic. Returns (output, error)."""
-        for attempt in range(max_retries + 1):
-            start = time.time()
-            try:
-                agent = self._agents.get(role)
-                if not agent:
-                    raise OpenCodeAgentError(f"No agent configured for role: {role}")
-
-                result = agent.run(user_prompt, system_prompt=system_prompt)
-                latency_ms = int((time.time() - start) * 1000)
-
-                # Parse structured output from Claude Code
-                output = result.get("output")
-                if isinstance(output, str):
-                    try:
-                        output = json.loads(output)
-                    except json.JSONDecodeError:
-                        # If not valid JSON, wrap in a dict
-                        output = {"raw_output": output, "files_changed": result.get("files_changed", [])}
-                elif output is None:
-                    output = {"raw_output": result.get("raw_output", ""), "files_changed": result.get("files_changed", [])}
-
-                await self._save_step(phase, role, json.dumps({"system": system_prompt, "user": user_prompt}), json.dumps(output), latency_ms, None)
-                return output, None
-            except OpenCodeAgentError as e:
-                latency_ms = int((time.time() - start) * 1000)
-                error_msg = str(e)
-                await self._save_step(phase, role, json.dumps({"system": system_prompt, "user": user_prompt}), None, latency_ms, error_msg)
-                if attempt == max_retries:
-                    await self._broadcast({"type": "phase_error", "phase": phase, "message": error_msg, "retryable": True})
-                    return None, error_msg
-                await self._broadcast({"type": "phase_error", "phase": phase, "message": f"Attempt {attempt + 1} failed: {error_msg}. Retrying...", "retryable": True})
-            except Exception as e:
-                latency_ms = int((time.time() - start) * 1000)
-                error_msg = str(e)
-                await self._save_step(phase, role, json.dumps({"system": system_prompt, "user": user_prompt}), None, latency_ms, error_msg)
-                await self._broadcast({"type": "phase_error", "phase": phase, "message": error_msg, "retryable": False})
-                return None, error_msg
-        return None, "Unexpected: all retries exhausted"
-
-    async def _get_agent(self, role: str) -> dict:
+    async def _load_agents(self) -> dict:
+        """Fetch all agents for this job from the DB."""
         db = await aiosqlite.connect(DB_PATH)
         db.row_factory = aiosqlite.Row
-        allowed_cols = {"planner": "planner_agent_id", "coder": "coder_agent_id", "tester": "tester_agent_id"}
-        col = allowed_cols.get(role)
-        if not col:
-            await db.close()
-            raise ValueError(f"Invalid agent role: {role}")
-        row = await (await db.execute(
-            f"SELECT a.* FROM agents a JOIN jobs j ON a.id = j.{col} WHERE j.id = ?",
-            (self.job["id"],)
-        )).fetchone()
+        agents = {}
+        mapping = {
+            "planner_agent_id": "planner",
+            "coder_agent_id": "coder",
+            "tester_agent_id": "tester",
+        }
+        for col, role in mapping.items():
+            row = await (await db.execute(
+                f"SELECT a.* FROM agents a JOIN jobs j ON a.id = j.{col} WHERE j.id = ?",
+                (self.job["id"],)
+            )).fetchone()
+            if row:
+                agents[row["id"]] = dict(row)
         await db.close()
-        result = dict(row)
-        result["_role"] = role
-        return result
+        return agents
 
     async def _update_status(self, status: str):
         db = await aiosqlite.connect(DB_PATH)
@@ -368,37 +350,6 @@ Produce a phased roadmap with definition_of_done per phase. Return JSON with: go
         output["_human_response"] = requests[-1]["response"]
         return output
 
-    async def _write_files(self, coder_output: dict):
-        working_dir = await self._get_setting("working_dir")
-        if not working_dir:
-            return
-        for f in coder_output.get("patch_or_full_files", []):
-            path = f["path"]
-            full_path = os.path.join(working_dir, path)
-            if not os.path.realpath(full_path).startswith(os.path.realpath(working_dir)):
-                raise ValueError(f"Path escape attempt: {path}")
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, "w") as fh:
-                fh.write(f["content"])
-
-    def _read_context_files(self, paths: list, working_dir: str) -> str:
-        if not paths or not working_dir:
-            return "No files selected."
-        contents = []
-        for p in paths:
-            full = os.path.join(working_dir, p)
-            if os.path.isfile(full):
-                with open(full) as f:
-                    contents.append(f"--- {p} ---\n{f.read()}")
-        return "\n\n".join(contents) if contents else "No readable files."
-
-    def _run_command(self, cmd: str) -> dict:
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, shell=True, timeout=60)
-            return {"command": cmd, "exit_code": result.returncode, "stdout": result.stdout[:5000], "stderr": result.stderr[:5000]}
-        except Exception as e:
-            return {"command": cmd, "exit_code": -1, "stdout": "", "stderr": str(e)}
-
     async def _get_setting(self, key: str) -> str:
         db = await aiosqlite.connect(DB_PATH)
         db.row_factory = aiosqlite.Row
@@ -420,22 +371,15 @@ Produce a phased roadmap with definition_of_done per phase. Return JSON with: go
         await db.commit()
         await db.close()
 
-    async def _append_output(self, field: str, output: dict):
-        db = await aiosqlite.connect(DB_PATH)
-        db.row_factory = aiosqlite.Row
-        row = await (await db.execute(f"SELECT {field} FROM runs WHERE id = ?", (self.run_id,))).fetchone()
-        items = json.loads(row[field] or "[]")
-        items.append(output)
-        await db.execute(f"UPDATE runs SET {field} = ? WHERE id = ?", (json.dumps(items), self.run_id))
-        await db.commit()
-        await db.close()
-
-    async def _save_step(self, phase: str, agent: str, input_data: str, output_data: str | None, latency_ms: int, error: str | None):
-        db = await aiosqlite.connect(DB_PATH)
-        db.row_factory = aiosqlite.Row
-        await db.execute(
-            "INSERT INTO run_steps (run_id, phase, agent, input, output, latency_ms, error) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (self.run_id, phase, agent, input_data, output_data, latency_ms, error)
-        )
-        await db.commit()
-        await db.close()
+    async def _write_files(self, coder_output: dict):
+        working_dir = await self._get_setting("working_dir")
+        if not working_dir:
+            return
+        for f in coder_output.get("patch_or_full_files", []):
+            path = f["path"]
+            full_path = os.path.join(working_dir, path)
+            if not os.path.realpath(full_path).startswith(os.path.realpath(working_dir)):
+                raise ValueError(f"Path escape attempt: {path}")
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w") as fh:
+                fh.write(f["content"])
