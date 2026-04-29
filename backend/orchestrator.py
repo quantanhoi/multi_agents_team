@@ -33,9 +33,9 @@ class Orchestrator:
             working_dir = await self._get_setting("working_dir") or "."
             self._worktree_manager = WorktreeManager(working_dir, self.run_id)
 
-            # Create worktrees and agent runners
+            # Create single shared worktree and agent runners
+            wt_path = self._worktree_manager.create()
             for role in ["planner", "coder", "tester"]:
-                wt_path = self._worktree_manager.create_worktree(role)
                 self._agents[role] = OpenCodeAgentRunner(
                     worktree_path=str(wt_path),
                     role=role,
@@ -75,9 +75,9 @@ class Orchestrator:
             await self._broadcast({"type": "error", "phase": "unknown", "message": str(e), "retryable": False})
             raise
         finally:
-            # Cleanup worktrees
+            # Cleanup worktree
             if self._worktree_manager:
-                self._worktree_manager.cleanup_all()
+                self._worktree_manager.remove()
 
     async def _planning_phase(self, feature_request: str, context: dict, human_response: str = ""):
         planner = await self._get_agent("planner")
@@ -147,8 +147,8 @@ Produce a phased roadmap with definition_of_done per phase. Return JSON with: go
         if self._worktree_manager:
             try:
                 plan_json = json.dumps(final_plan, indent=2)
-                self._worktree_manager.write_file("planner", "plan.json", plan_json)
-                self._worktree_manager.commit("planner", f"run-{self.run_id}: finalize plan")
+                self._worktree_manager.write_file("plan.json", plan_json)
+                self._worktree_manager.commit(f"run-{self.run_id}: finalize plan")
             except Exception:
                 pass
 
@@ -178,7 +178,7 @@ Produce a phased roadmap with definition_of_done per phase. Return JSON with: go
                 # Commit coder changes
                 if self._worktree_manager:
                     try:
-                        self._worktree_manager.commit("coder", f"run-{self.run_id}: phase {phase_idx + 1} coding")
+                        self._worktree_manager.commit(f"run-{self.run_id}: phase {phase_idx + 1} coding")
                     except Exception:
                         pass
 
@@ -205,8 +205,8 @@ Produce a phased roadmap with definition_of_done per phase. Return JSON with: go
                 # Commit tester report
                 if self._worktree_manager:
                     try:
-                        self._worktree_manager.write_file("tester", f"test_report_phase_{phase_idx}.json", json.dumps(tester_output, indent=2))
-                        self._worktree_manager.commit("tester", f"run-{self.run_id}: phase {phase_idx + 1} testing")
+                        self._worktree_manager.write_file(f"test_report_phase_{phase_idx}.json", json.dumps(tester_output, indent=2))
+                        self._worktree_manager.commit(f"run-{self.run_id}: phase {phase_idx + 1} testing")
                     except Exception:
                         pass
 

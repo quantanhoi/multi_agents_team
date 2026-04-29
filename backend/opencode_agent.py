@@ -182,32 +182,23 @@ class OpenCodeAgentRunner:
         return result.stdout if result.returncode == 0 else ""
 
     def read_other_agent_history(self, other_role: str, base_dir: str, n: int = 5) -> str:
-        """Read commit history from another agent's branch.
+        """Read commit history from the shared worktree branch.
+
+        Since all roles now share a single worktree, this simply returns the
+        recent git history of the current branch.
 
         Args:
-            other_role: The role of the other agent ('planner', 'coder', 'tester')
-            base_dir: The base directory of the project
+            other_role: Ignored (kept for backward compatibility)
+            base_dir: Ignored (kept for backward compatibility)
             n: Number of commits to show
 
         Returns:
             Formatted git log output
         """
-        branch_name = f"agent/run-{self.role.split('/')[-1] if '/' in self.role else 'unknown'}-{other_role}"
-
-        # Fetch the other agent's branch
         result = subprocess.run(
-            ["git", "fetch", "origin", branch_name],
+            ["git", "log", "--oneline", "-n", str(n)],
             cwd=str(self.worktree_path),
             capture_output=True,
             text=True,
         )
-
-        # Show log of the other branch
-        result = subprocess.run(
-            ["git", "log", "--oneline", "-n", str(n), f"origin/{branch_name}"],
-            cwd=str(self.worktree_path),
-            capture_output=True,
-            text=True,
-        )
-
-        return result.stdout if result.returncode == 0 else f"Could not read history from {other_role}"
+        return result.stdout if result.returncode == 0 else f"Could not read history from shared branch"
