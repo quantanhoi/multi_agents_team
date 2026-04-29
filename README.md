@@ -102,8 +102,11 @@ frontend/                 # React 18 + TypeScript + Vite
 
 ## Orchestration Flow
 
-1. **Planning draft** — Planner produces a phased roadmap with definition of done
-2. **Planning review** — Coder and Tester review the plan, suggest changes
-3. **Planning finalize** — Planner incorporates feedback into final roadmap
-4. **Execution loop** — Coder implements a phase → Tester reviews → Planner re-evaluates → continue/adjust/done
-5. **Human input** — Any agent can request human input at any phase, pausing the run
+The system runs a **strictly sequential role-based pipeline** with stateles per-step agent spawning:
+
+1. **Planner creates plan** — Analyzes task, produces plan.json + step-level DoD
+2. **Coder implements** — Reads plan, writes code, commits changes
+3. **Tester validates** — Reads code, runs tests, produces test report
+4. **Planner evaluates** — Checks if top-level DoD is satisfied. If yes → done. If no → proposes next step and loops.
+
+All roles share a single git worktree per run, using git commits and CHANGELOG.md to hand off state.

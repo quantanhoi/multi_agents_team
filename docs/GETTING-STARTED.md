@@ -99,8 +99,10 @@ And one default job: **Default Full-Stack Feature**
 4. Click **Run**
 
 The run starts in the background. You will see live phase updates via WebSocket:
-- `planning_draft` → `planning_review_coder` → `planning_review_tester` → `planning_finalize`
-- Then the execution loop: `coding` → `testing` → `evaluating` (repeats up to 5 times)
+- Sequential role steps: `planning` → `coding` → `testing` → `evaluating` (repeats up to 5 times)
+- Each step shows the active agent, model, and streaming output
+- Completed steps appear in the History panel
+- The override input box lets you interject at any time
 
 A typical run takes 3–10 minutes depending on model response times.
 
@@ -175,49 +177,39 @@ Look for the planning phase — you should see the file content included in the 
 ## Understanding the Run Lifecycle
 
 ```
-User Request
+User Request (+ Definition of Done)
     |
-    v
-+---------------+
-| planning_draft|  ← Planner creates roadmap
-+---------------+
-    |
-    v
-+---------------+
-|planning_review|  ← Coder reviews feasibility
-+---------------+
-    |
-    v
-+---------------+
-|planning_review|  ← Tester reviews test coverage
-+---------------+
-    |
-    v
-+---------------+
-|planning_final-|  ← Planner finalizes roadmap
-|     ize       |
-+---------------+
-    |
-    v
-+---------------+      +---------------+      +---------------+
-|    coding     |  →  |   testing     |  →  |  evaluating   |
-+---------------+      +---------------+      +---------------+
-    ^                                              |
-    |                                              |
-    +--------------- continue/adjust <-------------+
-                    |
-                    v
-              +---------+
-              |  done   |  ← All phases complete
-              +---------+
+    ▼
+┌──────────────────────────────────────────────────────────┐
+│  Iteration 1                                             │
+│  +---------------+   +---------------+   +---------------+ │
+│  │    PLANNER    │──→│     CODER     │──→│   TESTER      │ │
+│  │ Creates plan  │   │ Implements  │   │ Tests code    │ │
+│  │ + step-level  │   │ + commits   │   │ + reports     │ │
+│  │   DoD         │   │   changes     │   │               │ │
+│  +---------------+   +---------------+   +---------------+ │
+│                              ▼                           │
+│                        +---------------+                   │
+│                        │    PLANNER    │                  │
+│                        │  Evaluates:   │                  │
+│                        │  DoD met?     │                  │
+│                        │  Yes → done   │                  │
+│                        │  No → next    │                  │
+│                        │        iteration              │
+│                        +---------------+                   │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ### Key concepts
 
-- **Phase** — One step in the pipeline (e.g., `coding`)
-- **Iteration** — One full pass through coding → testing → evaluating
-- **Human-in-the-loop** — Agents can pause and ask you questions mid-run
-- **Max iterations** — Default is 5; the Planner decides `continue`/`adjust`/`done`
+- **Step** — One agent invocation (e.g., planner plan, coder code, tester test)
+- **Iteration** — One full pass through planner → coder → tester → planner evaluate
+- **Sequential** — Roles run one at a time, never in parallel
+- **Shared worktree** — All roles use the same git branch; commits are the handoff mechanism
+- **CHANGELOG.md** — Auto-generated in the worktree; every appends step history for context
+- **Human-in-the-loop** — Any role can pause and ask questions; frontend shows persistent input panel
+- **Override** — User can interject at any time via the Active Step Panel chat input
+- **Max iterations** — Default is 5; the Planner decides `continue`/`done` after each evaluate step
 
 ---
 
@@ -271,8 +263,10 @@ This was a caching bug that has been fixed. If you see it:
 
 - **Customize agents** — Edit system prompts, temperature, or swap models
 - **Create jobs** — Assign different agent combinations to different tasks
-- **Review runs** — Check `run_steps` in the database for per-phase timing
-- **Read the project state** — See `docs/PROJECT-STATE-2026-04-28.md` for detailed architecture
+- **Set Definition of Done** — Each job's top-level DoD guides the pipeline
+- **Review runs** — Check the History panel for step-by-step output
+- **Read the project state** — See `docs/PROJECT-STATE-2026-04-29.md` for detailed architecture
+- **Read the changelog** — See `docs/CHANGELOG-2026-04-29.md` for complete list of changes
 
 ---
 
