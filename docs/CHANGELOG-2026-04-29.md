@@ -213,9 +213,126 @@ cd backend
 
 ---
 
-## Commits
+## 6. Session Fixes — 2026-04-30
+
+This session fixed critical bugs discovered during end-to-end testing of the portfolio website job.
+
+### Bug Fixes
+
+#### `backend/opencode_agent.py` — Async subprocess (critical fix)
+
+| Problem | Solution |
+|---------|----------|
+| `subprocess.run()` blocked FastAPI event loop for 60–120s during LLM calls | Changed to `asyncio.run_in_executor(None, subprocess.run, ...)` so LLM calls run in thread pool and backend API stays responsive |
+| `asyncio.create_subprocess_exec()` stripped `PATH` env var causing `python3: not found` | Reverted to thread pool executor approach — preserves full `os.environ` including `PATH` |
+| API requests to `/api/runs`, `/api/settings` timed out during runs | Now all endpoints respond within 5 seconds even while agents are running |
+
+**Before (blocking):**
+```python
+result = subprocess.run(cmd, cwd=..., capture_output=True, text=True, timeout=600)
+```
+
+**After (non-blocking):**
+```python
+loop = asyncio.get_running_loop()
+result = await asyncio.wait_for(
+    loop.run_in_executor(None, lambda: subprocess.run(cmd, ...)),
+    timeout=610
+)
+```
+
+#### `backend/orchestrator.py` — Pass role to agent runner
+
+| Problem | Solution |
+|---------|----------|
+| `opencode` CLI guessed role from model name (`kimi`/`glm`/`deepseek`) — all agents got generic prompt | Orchestrator now passes `OPENCODE_ROLE=planner|coder|tester` via environment variable |
+| Coder received generic prompt instead of "write code" prompt | `OpenCodeAgentRunner.__init__` stores role, `run()` sets `env["OPENCODE_ROLE"]=self.role` |
+
+#### `scripts/opencode` — Parse JSON file writes (critical fix)
+
+| Problem | Solution |
+|---------|----------|
+| LLM returned JSON wrapped in markdown code blocks (` ```json ... ``` `) — `json.loads()` threw `JSONDecodeError` | Added special handling: when markdown block has `lang == 'json'`, parse inner JSON and extract `patch_or_full_files` |
+| Valid JSON responses skipped file writing entirely | Both paths now call `extract_files_from_json()` — for raw JSON AND markdown-wrapped JSON |
+| `extract_files_from_json()` had `continue` before `for entry in arr` due to wrong indentation | Fixed indentation: `for entry in arr:` now runs after `continue`, not skipped |
+| `os.getcwd()` failed when process had no working directory | Added `WORKTREE_PATH` env variable fallback to `/workspace` |
+| `git commit` called in fallback script, but orchestrator also commits — double commits | Changed to `git_stage_files()` (only `git add`) — orchestrator handles actual commit |
+| `lang == 'json'` was not in the language-to-filename mapping | Added special case: JSON blocks parse and extract files instead of writing `.json` file |
+
+**Key file extraction logic:**
+```python
+def write_files_from_markdown(text):
+    for lang, code in matches:
+        if lang == 'json':
+            parsed = json.loads(code)
+            files = extract_files_from_json(parsed)  # NEW
+            written.extend(files)
+            continue
+```
+
+#### `backend/worktree_manager.py` / `Dockerfile` — Git ownership fix
+
+| Problem | Solution |
+|---------|----------|
+| Git worktree creation failed: `fatal: detected dubious ownership in repository at '/workspace'` | Added `RUN git config --system --add safe.directory '*'` to `backend/Dockerfile` |
+| Container runs as root but `/workspace` is owned by host user (1000:1000) | System-level git config trusts all directories inside the container |
+
+#### `docker-compose.yml` — Environment and mounts
+
+| Problem | Solution |
+|---------|----------|
+| `PROJECT_DIR` in `.env` pointed to wrong path (`thanh_portfolio` vs `thanh_portfolio_test`) | Updated `.env` to `PROJECT_DIR=/home/edward/github/thanh_portfolio_test` |
+| `.env` had wrong `OLLAMA_API` key | Updated to current active key |
+| `docker-compose.yml` missing `GITHUB_TOKEN` env var for auto-push | Added `GITHUB_TOKEN=${GITHUB_TOKEN:-}` and `GIT_USER_NAME`/`GIT_USER_EMAIL` |
+
+#### `backend/models.py` — Missing field
+
+| Problem | Solution |
+|---------|----------|
+| `PUT /api/jobs/{id}` failed validation when `definition_of_done` not provided | Added `definition_of_done: Optional[str] = None` to `JobUpdate` model |
+
+### New Component — CLI Runner
+
+Replaced the React frontend with a command-line interface that is more reliable during long-running LLM calls.
+
+| File | Purpose |
+|------|---------|
+| `cli.py` | Python CLI runner — interactive and one-shot modes |
+
+**Features:**
+- Lists jobs and agents from API
+- Prompts for feature request
+- Polls `GET /api/runs/{id}/steps` every 2 seconds
+- Color-coded output by agent role (planner=cyan, coder=green, tester=red)
+- Handles `waiting_for_human` with interactive prompt
+- Shows generated files tree on completion
+- Works even when backend is processing LLM calls (uses polling, not WebSocket)
+
+**Usage:**
+```bash
+python cli.py                    # Interactive mode
+python cli.py --job 2 "Build a portfolio site"  # One-shot mode
+```
+
+### Files Added/Modified in This Session
+
+| File | Change |
+|------|--------|
+| `cli.py` | **New** — Command-line runner replacing frontend |
+| `backend/opencode_agent.py` | Critical fix: thread pool executor for non-blocking LLM calls |
+| `backend/orchestrator.py` | Added `OPENCODE_ROLE` env var passing to agent runner |
+| `scripts/opencode` | **New** — Fixed fallback CLI with JSON parsing and file extraction |
+| `scripts/opencode_fallback.py` | **New** | Backup fallback script |
+| `backend/Dockerfile` | Added `git config --system --add safe.directory '*'` |
+| `docker-compose.yml` | Added `GITHUB_TOKEN`, `GIT_USER_NAME`, `GIT_USER_EMAIL` env vars |
+| `.env` | Updated `PROJECT_DIR` and `OLLAMA_API` |
+| `backend/models.py` | Added `definition_of_done` to `JobUpdate` |
+
+### Commits
 
 ```
+205d72b feat(cli): add command-line runner replacing frontend
+bae4846 fix: address blocking API, git ownership, model names, and file writing bugs
 3b434a7 test: add integration test for sequential pipeline
 d6a9f64 feat: restructure RunPage with ActiveStep, History, HumanInput panels
 b6c6796 feat: add /steps and /changelog endpoints for run history
